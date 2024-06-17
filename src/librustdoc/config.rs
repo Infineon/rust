@@ -160,6 +160,9 @@ pub(crate) struct Options {
     /// the compiler will scrape examples and not generate documentation.
     pub(crate) scrape_examples_options: Option<ScrapeExamplesOptions>,
 
+    /// Whether to generate documentation for tests.
+    pub(crate) document_tests: bool,
+
     /// Note: this field is duplicated in `RenderOptions` because it's useful
     /// to have it in both places.
     pub(crate) unstable_features: rustc_feature::UnstableFeatures,
@@ -213,6 +216,7 @@ impl fmt::Debug for Options {
             .field("test_builder_wrappers", &self.test_builder_wrappers)
             .field("nocapture", &self.nocapture)
             .field("scrape_examples_options", &self.scrape_examples_options)
+            .field("document_tests", &self.document_tests)
             .field("unstable_features", &self.unstable_features)
             .finish()
     }
@@ -732,6 +736,7 @@ impl Options {
         }
 
         let scrape_examples_options = ScrapeExamplesOptions::new(matches, &dcx);
+        let document_tests = matches.opt_present("document-tests");
         let with_examples = matches.opt_strs("with-examples");
         let call_locations = crate::scrape_examples::load_call_locations(with_examples, &dcx);
 
@@ -777,6 +782,7 @@ impl Options {
             output_format,
             json_unused_externs,
             scrape_examples_options,
+            document_tests,
             unstable_features,
             expanded_args: args,
         };
