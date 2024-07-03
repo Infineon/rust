@@ -160,9 +160,6 @@ pub(crate) struct Options {
     /// the compiler will scrape examples and not generate documentation.
     pub(crate) scrape_examples_options: Option<ScrapeExamplesOptions>,
 
-    /// Whether to generate documentation for tests.
-    pub(crate) document_tests: bool,
-
     /// Note: this field is duplicated in `RenderOptions` because it's useful
     /// to have it in both places.
     pub(crate) unstable_features: rustc_feature::UnstableFeatures,
@@ -216,7 +213,6 @@ impl fmt::Debug for Options {
             .field("test_builder_wrappers", &self.test_builder_wrappers)
             .field("nocapture", &self.nocapture)
             .field("scrape_examples_options", &self.scrape_examples_options)
-            .field("document_tests", &self.document_tests)
             .field("unstable_features", &self.unstable_features)
             .finish()
     }
@@ -276,6 +272,8 @@ pub(crate) struct RenderOptions {
     pub(crate) document_private: bool,
     /// Document items that have `doc(hidden)`.
     pub(crate) document_hidden: bool,
+    /// Document tests.
+    pub(crate) document_tests: bool,
     /// If `true`, generate a JSON file in the crate folder instead of HTML redirection files.
     pub(crate) generate_redirect_map: bool,
     /// Show the memory layout of types in the docs.
@@ -782,7 +780,6 @@ impl Options {
             output_format,
             json_unused_externs,
             scrape_examples_options,
-            document_tests,
             unstable_features,
             expanded_args: args,
         };
@@ -806,6 +803,7 @@ impl Options {
             markdown_playground_url,
             document_private,
             document_hidden,
+            document_tests,
             generate_redirect_map,
             show_type_layout,
             unstable_features,

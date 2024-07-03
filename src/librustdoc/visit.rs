@@ -25,6 +25,7 @@ pub(crate) trait DocVisitor: Sized {
             ExternCrateItem { src: _ }
             | ImportItem(_)
             | FunctionItem(_)
+            | TestItem(_)
             | TypeAliasItem(_)
             | OpaqueTyItem(_)
             | StaticItem(_)
