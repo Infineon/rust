@@ -506,8 +506,16 @@ impl<'a, 'tcx> RustdocVisitor<'a, 'tcx> {
             hir::ItemKind::Mod(ref m) => {
                 self.enter_mod(item.owner_id.def_id, m, name, renamed, import_id);
             }
-            hir::ItemKind::Fn(..)
-            | hir::ItemKind::ExternCrate(..)
+            hir::ItemKind::Fn(fn_sig, _, _) => {
+                // Don't show auto created function "main" that is not in the source code (empty span) when documenting tests.
+                if !(self.cx.cache.document_tests
+                    && fn_sig.span.is_empty()
+                    && name.as_str() == "main")
+                {
+                    self.add_to_current_mod(item, renamed, import_id);
+                }
+            }
+            hir::ItemKind::ExternCrate(..)
             | hir::ItemKind::Enum(..)
             | hir::ItemKind::Struct(..)
             | hir::ItemKind::Union(..)
