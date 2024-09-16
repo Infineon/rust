@@ -18,26 +18,27 @@
 //! On success, the  LUB/GLB operations return the appropriate bound. The
 //! return value of `Equate` or `Sub` shouldn't really be used.
 
+use rustc_middle::bug;
+use rustc_middle::infer::unify_key::EffectVarValue;
+use rustc_middle::traits::solve::Goal;
+use rustc_middle::ty::error::{ExpectedFound, TypeError};
+use rustc_middle::ty::{self, InferConst, IntType, Ty, TyCtxt, TypeVisitableExt, UintType, Upcast};
+pub use rustc_next_trait_solver::relate::combine::*;
+use tracing::debug;
+
 use super::glb::Glb;
 use super::lub::Lub;
 use super::type_relating::TypeRelating;
-use super::StructurallyRelateAliases;
-use crate::infer::{DefineOpaqueTypes, InferCtxt, TypeTrace};
-use crate::traits::{Obligation, PredicateObligations};
-use rustc_middle::bug;
-use rustc_middle::infer::unify_key::EffectVarValue;
-use rustc_middle::ty::error::TypeError;
-use rustc_middle::ty::relate::{RelateResult, TypeRelation};
-use rustc_middle::ty::{self, InferConst, Ty, TyCtxt, TypeVisitableExt, Upcast};
-use rustc_middle::ty::{IntType, UintType};
-use rustc_span::Span;
+use super::{RelateResult, StructurallyRelateAliases};
+use crate::infer::{relate, DefineOpaqueTypes, InferCtxt, TypeTrace};
+use crate::traits::{Obligation, PredicateObligation};
 
 #[derive(Clone)]
 pub struct CombineFields<'infcx, 'tcx> {
     pub infcx: &'infcx InferCtxt<'tcx>,
     pub trace: TypeTrace<'tcx>,
     pub param_env: ty::ParamEnv<'tcx>,
-    pub obligations: PredicateObligations<'tcx>,
+    pub goals: Vec<Goal<'tcx, ty::Predicate<'tcx>>>,
     pub define_opaque_types: DefineOpaqueTypes,
 }
 
@@ -48,7 +49,21 @@ impl<'infcx, 'tcx> CombineFields<'infcx, 'tcx> {
         param_env: ty::ParamEnv<'tcx>,
         define_opaque_types: DefineOpaqueTypes,
     ) -> Self {
-        Self { infcx, trace, param_env, define_opaque_types, obligations: vec![] }
+        Self { infcx, trace, param_env, define_opaque_types, goals: vec![] }
+    }
+
+    pub(crate) fn into_obligations(self) -> Vec<PredicateObligation<'tcx>> {
+        self.goals
+            .into_iter()
+            .map(|goal| {
+                Obligation::new(
+                    self.infcx.tcx,
+                    self.trace.cause.clone(),
+                    goal.param_env,
+                    goal.predicate,
+                )
+            })
+            .collect()
     }
 }
 
@@ -60,8 +75,9 @@ impl<'tcx> InferCtxt<'tcx> {
         b: Ty<'tcx>,
     ) -> RelateResult<'tcx, Ty<'tcx>>
     where
-        R: ObligationEmittingRelation<'tcx>,
+        R: PredicateEmittingRelation<InferCtxt<'tcx>>,
     {
+        debug!("super_combine_tys::<{}>({:?}, {:?})", std::any::type_name::<R>(), a, b);
         debug_assert!(!a.has_escaping_bound_vars());
         debug_assert!(!b.has_escaping_bound_vars());
 
@@ -121,10 +137,10 @@ impl<'tcx> InferCtxt<'tcx> {
             (_, ty::Alias(..)) | (ty::Alias(..), _) if self.next_trait_solver() => {
                 match relation.structurally_relate_aliases() {
                     StructurallyRelateAliases::Yes => {
-                        ty::relate::structurally_relate_tys(relation, a, b)
+                        relate::structurally_relate_tys(relation, a, b)
                     }
                     StructurallyRelateAliases::No => {
-                        relation.register_type_relate_obligation(a, b);
+                        relation.register_alias_relate_predicate(a, b);
                         Ok(a)
                     }
                 }
@@ -132,19 +148,19 @@ impl<'tcx> InferCtxt<'tcx> {
 
             // All other cases of inference are errors
             (&ty::Infer(_), _) | (_, &ty::Infer(_)) => {
-                Err(TypeError::Sorts(ty::relate::expected_found(a, b)))
+                Err(TypeError::Sorts(ExpectedFound::new(true, a, b)))
             }
 
             // During coherence, opaque types should be treated as *possibly*
             // equal to any other type (except for possibly itself). This is an
-            // extremely heavy hammer, but can be relaxed in a fowards-compatible
+            // extremely heavy hammer, but can be relaxed in a forwards-compatible
             // way later.
             (&ty::Alias(ty::Opaque, _), _) | (_, &ty::Alias(ty::Opaque, _)) if self.intercrate => {
                 relation.register_predicates([ty::Binder::dummy(ty::PredicateKind::Ambiguous)]);
                 Ok(a)
             }
 
-            _ => ty::relate::structurally_relate_tys(relation, a, b),
+            _ => relate::structurally_relate_tys(relation, a, b),
         }
     }
 
@@ -155,11 +171,12 @@ impl<'tcx> InferCtxt<'tcx> {
         b: ty::Const<'tcx>,
     ) -> RelateResult<'tcx, ty::Const<'tcx>>
     where
-        R: ObligationEmittingRelation<'tcx>,
+        R: PredicateEmittingRelation<InferCtxt<'tcx>>,
     {
-        debug!("{}.consts({:?}, {:?})", relation.tag(), a, b);
+        debug!("super_combine_consts::<{}>({:?}, {:?})", std::any::type_name::<R>(), a, b);
         debug_assert!(!a.has_escaping_bound_vars());
         debug_assert!(!b.has_escaping_bound_vars());
+
         if a == b {
             return Ok(a);
         }
@@ -234,11 +251,11 @@ impl<'tcx> InferCtxt<'tcx> {
                         Ok(b)
                     }
                     StructurallyRelateAliases::Yes => {
-                        ty::relate::structurally_relate_consts(relation, a, b)
+                        relate::structurally_relate_consts(relation, a, b)
                     }
                 }
             }
-            _ => ty::relate::structurally_relate_consts(relation, a, b),
+            _ => relate::structurally_relate_consts(relation, a, b),
         }
     }
 
@@ -289,41 +306,21 @@ impl<'infcx, 'tcx> CombineFields<'infcx, 'tcx> {
         Glb::new(self)
     }
 
-    pub fn register_obligations(&mut self, obligations: PredicateObligations<'tcx>) {
-        self.obligations.extend(obligations);
+    pub fn register_obligations(
+        &mut self,
+        obligations: impl IntoIterator<Item = Goal<'tcx, ty::Predicate<'tcx>>>,
+    ) {
+        self.goals.extend(obligations);
     }
 
     pub fn register_predicates(
         &mut self,
         obligations: impl IntoIterator<Item: Upcast<TyCtxt<'tcx>, ty::Predicate<'tcx>>>,
     ) {
-        self.obligations.extend(obligations.into_iter().map(|to_pred| {
-            Obligation::new(self.infcx.tcx, self.trace.cause.clone(), self.param_env, to_pred)
-        }))
+        self.goals.extend(
+            obligations
+                .into_iter()
+                .map(|to_pred| Goal::new(self.infcx.tcx, self.param_env, to_pred)),
+        )
     }
-}
-
-pub trait ObligationEmittingRelation<'tcx>: TypeRelation<'tcx> {
-    fn span(&self) -> Span;
-
-    fn param_env(&self) -> ty::ParamEnv<'tcx>;
-
-    /// Whether aliases should be related structurally. This is pretty much
-    /// always `No` unless you're equating in some specific locations of the
-    /// new solver. See the comments in these use-cases for more details.
-    fn structurally_relate_aliases(&self) -> StructurallyRelateAliases;
-
-    /// Register obligations that must hold in order for this relation to hold
-    fn register_obligations(&mut self, obligations: PredicateObligations<'tcx>);
-
-    /// Register predicates that must hold in order for this relation to hold. Uses
-    /// a default obligation cause, [`ObligationEmittingRelation::register_obligations`] should
-    /// be used if control over the obligation causes is required.
-    fn register_predicates(
-        &mut self,
-        obligations: impl IntoIterator<Item: Upcast<TyCtxt<'tcx>, ty::Predicate<'tcx>>>,
-    );
-
-    /// Register `AliasRelate` obligation(s) that both types must be related to each other.
-    fn register_type_relate_obligation(&mut self, a: Ty<'tcx>, b: Ty<'tcx>);
 }

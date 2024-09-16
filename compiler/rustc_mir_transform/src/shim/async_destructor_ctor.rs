@@ -19,10 +19,11 @@ use rustc_span::source_map::respan;
 use rustc_span::{Span, Symbol};
 use rustc_target::abi::{FieldIdx, VariantIdx};
 use rustc_target::spec::PanicStrategy;
+use tracing::debug;
 
 use super::{local_decls_for_sig, new_body};
 
-pub fn build_async_destructor_ctor_shim<'tcx>(
+pub(super) fn build_async_destructor_ctor_shim<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: DefId,
     ty: Option<Ty<'tcx>>,
@@ -343,7 +344,7 @@ impl<'tcx> AsyncDestructorCtorShimBuilder<'tcx> {
                 .tcx
                 .mk_place_elems(&[PlaceElem::Deref, PlaceElem::Field(field, field_ty)]),
         };
-        self.put_temp_rvalue(Rvalue::AddressOf(Mutability::Mut, place))
+        self.put_temp_rvalue(Rvalue::RawPtr(Mutability::Mut, place))
     }
 
     /// If given Self is an enum puts `to_drop: *mut FieldTy` on top of
@@ -363,7 +364,7 @@ impl<'tcx> AsyncDestructorCtorShimBuilder<'tcx> {
                 PlaceElem::Field(field, field_ty),
             ]),
         };
-        self.put_temp_rvalue(Rvalue::AddressOf(Mutability::Mut, place))
+        self.put_temp_rvalue(Rvalue::RawPtr(Mutability::Mut, place))
     }
 
     /// If given Self is an enum puts `to_drop: *mut FieldTy` on top of
@@ -529,7 +530,7 @@ impl<'tcx> AsyncDestructorCtorShimBuilder<'tcx> {
 
         last_bb.terminator = Some(Terminator { source_info, kind: TerminatorKind::Return });
 
-        let source = MirSource::from_instance(ty::InstanceDef::AsyncDropGlueCtorShim(
+        let source = MirSource::from_instance(ty::InstanceKind::AsyncDropGlueCtorShim(
             self.def_id,
             self.self_ty,
         ));
@@ -561,7 +562,7 @@ impl<'tcx> AsyncDestructorCtorShimBuilder<'tcx> {
 
             // If projection of Discriminant then compare with `Ty::discriminant_ty`
             if let ty::Alias(ty::Projection, ty::AliasTy { args, def_id, .. }) = expected_ty.kind()
-                && Some(*def_id) == self.tcx.lang_items().discriminant_type()
+                && self.tcx.is_lang_item(*def_id, LangItem::Discriminant)
                 && args.first().unwrap().as_type().unwrap().discriminant_ty(self.tcx) == operand_ty
             {
                 return;

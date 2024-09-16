@@ -1,11 +1,11 @@
-use crate::traits::*;
-
 use rustc_middle::bug;
 use rustc_middle::ty::{self, GenericArgKind, Ty};
 use rustc_session::config::Lto;
 use rustc_symbol_mangling::typeid_for_trait_ref;
 use rustc_target::abi::call::FnAbi;
 use tracing::{debug, instrument};
+
+use crate::traits::*;
 
 #[derive(Copy, Clone, Debug)]
 pub struct VirtualIndex(u64);
@@ -133,6 +133,7 @@ pub fn get_vtable<'tcx, Cx: CodegenMethods<'tcx>>(
     let align = cx.data_layout().pointer_align.abi;
     let vtable = cx.static_addr_of(vtable_const, align, Some("vtable"));
 
+    cx.apply_vcall_visibility_metadata(ty, trait_ref, vtable);
     cx.create_vtable_debuginfo(ty, trait_ref, vtable);
     cx.vtables().borrow_mut().insert((ty, trait_ref), vtable);
     vtable

@@ -3,21 +3,16 @@ use std::cell::RefCell;
 use std::hash::Hash;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::OnceLock as OnceCell;
+use std::sync::{Arc, OnceLock as OnceCell};
 use std::{fmt, iter};
 
 use arrayvec::ArrayVec;
-use thin_vec::ThinVec;
-
-use rustc_ast as ast;
 use rustc_ast_pretty::pprust;
 use rustc_attr::{ConstStability, Deprecation, Stability, StabilityLevel, StableSince};
 use rustc_const_eval::const_eval::is_unstable_const_fn;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_hir as hir;
 use rustc_hir::def::{CtorKind, DefKind, Res};
-use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE};
+use rustc_hir::def_id::{CrateNum, DefId, LocalDefId, LOCAL_CRATE};
 use rustc_hir::lang_items::LangItem;
 use rustc_hir::{BodyId, Mutability};
 use rustc_hir_analysis::check::intrinsic::intrinsic_operation_unsafety;
@@ -35,7 +30,15 @@ use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::{FileName, Loc, DUMMY_SP};
 use rustc_target::abi::VariantIdx;
 use rustc_target::spec::abi::Abi;
+use thin_vec::ThinVec;
+use tracing::{debug, trace};
+use {rustc_ast as ast, rustc_hir as hir};
 
+pub(crate) use self::ItemKind::*;
+pub(crate) use self::Type::{
+    Array, BareFunction, BorrowedRef, DynTrait, Generic, ImplTrait, Infer, Primitive, QPath,
+    RawPointer, SelfTy, Slice, Tuple,
+};
 use crate::clean::cfg::Cfg;
 use crate::clean::clean_middle_path;
 use crate::clean::inline::{self, print_inlined_const};
@@ -45,13 +48,6 @@ use crate::formats::cache::Cache;
 use crate::formats::item_type::ItemType;
 use crate::html::render::Context;
 use crate::passes::collect_intra_doc_links::UrlFragment;
-
-pub(crate) use self::ItemKind::*;
-pub(crate) use self::SelfTy::*;
-pub(crate) use self::Type::{
-    Array, BareFunction, BorrowedRef, DynTrait, Generic, ImplTrait, Infer, Primitive, QPath,
-    RawPointer, Slice, Tuple,
-};
 
 #[cfg(test)]
 mod tests;
@@ -91,6 +87,11 @@ impl ItemId {
             ItemId::DefId(id) => Some(id),
             _ => None,
         }
+    }
+
+    #[inline]
+    pub(crate) fn as_local_def_id(self) -> Option<LocalDefId> {
+        self.as_def_id().and_then(|id| id.as_local())
     }
 
     #[inline]
@@ -319,14 +320,28 @@ pub(crate) struct Item {
     /// The name of this item.
     /// Optional because not every item has a name, e.g. impls.
     pub(crate) name: Option<Symbol>,
-    pub(crate) attrs: Box<Attributes>,
+    pub(crate) inner: Box<ItemInner>,
+    pub(crate) item_id: ItemId,
+    /// This is the `LocalDefId` of the `use` statement if the item was inlined.
+    /// The crate metadata doesn't hold this information, so the `use` statement
+    /// always belongs to the current crate.
+    pub(crate) inline_stmt_id: Option<LocalDefId>,
+    pub(crate) cfg: Option<Arc<Cfg>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ItemInner {
     /// Information about this item that is specific to what kind of item it is.
     /// E.g., struct vs enum vs function.
-    pub(crate) kind: Box<ItemKind>,
-    pub(crate) item_id: ItemId,
-    /// This is the `DefId` of the `use` statement if the item was inlined.
-    pub(crate) inline_stmt_id: Option<DefId>,
-    pub(crate) cfg: Option<Arc<Cfg>>,
+    pub(crate) kind: ItemKind,
+    pub(crate) attrs: Attributes,
+}
+
+impl std::ops::Deref for Item {
+    type Target = ItemInner;
+    fn deref(&self) -> &ItemInner {
+        &*self.inner
+    }
 }
 
 /// NOTE: this does NOT unconditionally print every item, to avoid thousands of lines of logs.
@@ -368,11 +383,11 @@ fn is_field_vis_inherited(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
 }
 
 impl Item {
-    pub(crate) fn stability<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Option<Stability> {
+    pub(crate) fn stability(&self, tcx: TyCtxt<'_>) -> Option<Stability> {
         self.def_id().and_then(|did| tcx.lookup_stability(did))
     }
 
-    pub(crate) fn const_stability<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Option<ConstStability> {
+    pub(crate) fn const_stability(&self, tcx: TyCtxt<'_>) -> Option<ConstStability> {
         self.def_id().and_then(|did| tcx.lookup_const_stability(did))
     }
 
@@ -388,9 +403,9 @@ impl Item {
     }
 
     pub(crate) fn span(&self, tcx: TyCtxt<'_>) -> Option<Span> {
-        let kind = match &*self.kind {
-            ItemKind::StrippedItem(k) => k,
-            _ => &*self.kind,
+        let kind = match &self.kind {
+            ItemKind::StrippedItem(k) => &*k,
+            _ => &self.kind,
         };
         match kind {
             ItemKind::ModuleItem(Module { span, .. }) => Some(*span),
@@ -435,7 +450,7 @@ impl Item {
             def_id,
             name,
             kind,
-            Box::new(Attributes::from_ast(ast_attrs)),
+            Attributes::from_ast(ast_attrs),
             ast_attrs.cfg(cx.tcx, &cx.cache.hidden_cfg),
         )
     }
@@ -444,16 +459,15 @@ impl Item {
         def_id: DefId,
         name: Option<Symbol>,
         kind: ItemKind,
-        attrs: Box<Attributes>,
+        attrs: Attributes,
         cfg: Option<Arc<Cfg>>,
     ) -> Item {
         trace!("name={name:?}, def_id={def_id:?} cfg={cfg:?}");
 
         Item {
             item_id: def_id.into(),
-            kind: Box::new(kind),
+            inner: Box::new(ItemInner { kind, attrs }),
             name,
-            attrs,
             cfg,
             inline_stmt_id: None,
         }
@@ -511,9 +525,6 @@ impl Item {
     pub(crate) fn is_mod(&self) -> bool {
         self.type_() == ItemType::Module
     }
-    pub(crate) fn is_trait(&self) -> bool {
-        self.type_() == ItemType::Trait
-    }
     pub(crate) fn is_struct(&self) -> bool {
         self.type_() == ItemType::Struct
     }
@@ -524,25 +535,22 @@ impl Item {
         self.type_() == ItemType::Variant
     }
     pub(crate) fn is_associated_type(&self) -> bool {
-        matches!(&*self.kind, AssocTypeItem(..) | StrippedItem(box AssocTypeItem(..)))
+        matches!(self.kind, AssocTypeItem(..) | StrippedItem(box AssocTypeItem(..)))
     }
     pub(crate) fn is_ty_associated_type(&self) -> bool {
-        matches!(&*self.kind, TyAssocTypeItem(..) | StrippedItem(box TyAssocTypeItem(..)))
+        matches!(self.kind, TyAssocTypeItem(..) | StrippedItem(box TyAssocTypeItem(..)))
     }
     pub(crate) fn is_associated_const(&self) -> bool {
-        matches!(&*self.kind, AssocConstItem(..) | StrippedItem(box AssocConstItem(..)))
+        matches!(self.kind, AssocConstItem(..) | StrippedItem(box AssocConstItem(..)))
     }
     pub(crate) fn is_ty_associated_const(&self) -> bool {
-        matches!(&*self.kind, TyAssocConstItem(..) | StrippedItem(box TyAssocConstItem(..)))
+        matches!(self.kind, TyAssocConstItem(..) | StrippedItem(box TyAssocConstItem(..)))
     }
     pub(crate) fn is_method(&self) -> bool {
         self.type_() == ItemType::Method
     }
     pub(crate) fn is_ty_method(&self) -> bool {
         self.type_() == ItemType::TyMethod
-    }
-    pub(crate) fn is_type_alias(&self) -> bool {
-        self.type_() == ItemType::TypeAlias
     }
     pub(crate) fn is_primitive(&self) -> bool {
         self.type_() == ItemType::Primitive
@@ -560,14 +568,14 @@ impl Item {
         self.type_() == ItemType::Keyword
     }
     pub(crate) fn is_stripped(&self) -> bool {
-        match *self.kind {
+        match self.kind {
             StrippedItem(..) => true,
             ImportItem(ref i) => !i.should_be_displayed,
             _ => false,
         }
     }
     pub(crate) fn has_stripped_entries(&self) -> Option<bool> {
-        match *self.kind {
+        match self.kind {
             StructItem(ref struct_) => Some(struct_.has_stripped_entries()),
             UnionItem(ref union_) => Some(union_.has_stripped_entries()),
             EnumItem(ref enum_) => Some(enum_.has_stripped_entries()),
@@ -610,7 +618,7 @@ impl Item {
     }
 
     pub(crate) fn is_default(&self) -> bool {
-        match *self.kind {
+        match self.kind {
             ItemKind::MethodItem(_, Some(defaultness)) => {
                 defaultness.has_value() && !defaultness.is_final()
             }
@@ -638,15 +646,15 @@ impl Item {
             };
             hir::FnHeader { safety: sig.safety(), abi: sig.abi(), constness, asyncness }
         }
-        let header = match *self.kind {
-            ItemKind::ForeignFunctionItem(_) => {
+        let header = match self.kind {
+            ItemKind::ForeignFunctionItem(_, safety) => {
                 let def_id = self.def_id().unwrap();
                 let abi = tcx.fn_sig(def_id).skip_binder().abi();
                 hir::FnHeader {
                     safety: if abi == Abi::RustIntrinsic {
                         intrinsic_operation_unsafety(tcx, def_id.expect_local())
                     } else {
-                        hir::Safety::Unsafe
+                        safety
                     },
                     abi,
                     constness: if tcx.is_const_fn(def_id)
@@ -680,7 +688,7 @@ impl Item {
             ItemId::DefId(def_id) => def_id,
         };
 
-        match *self.kind {
+        match self.kind {
             // Primitives and Keywords are written in the source code as private modules.
             // The modules need to be private so that nobody actually uses them, but the
             // keywords and primitives that they are documenting are public.
@@ -710,7 +718,7 @@ impl Item {
             _ => {}
         }
         let def_id = match self.inline_stmt_id {
-            Some(inlined) => inlined,
+            Some(inlined) => inlined.to_def_id(),
             None => def_id,
         };
         Some(tcx.visibility(def_id))
@@ -832,9 +840,7 @@ pub(crate) enum ItemKind {
     TestItem(Box<Function>),
     ModuleItem(Module),
     TypeAliasItem(Box<TypeAlias>),
-    OpaqueTyItem(OpaqueTy),
     StaticItem(Static),
-    ConstantItem(Constant),
     TraitItem(Box<Trait>),
     TraitAliasItem(TraitAlias),
     ImplItem(Box<Impl>),
@@ -847,9 +853,9 @@ pub(crate) enum ItemKind {
     StructFieldItem(Type),
     VariantItem(Variant),
     /// `fn`s from an extern block
-    ForeignFunctionItem(Box<Function>),
+    ForeignFunctionItem(Box<Function>, hir::Safety),
     /// `static`s from an extern block
-    ForeignStaticItem(Static),
+    ForeignStaticItem(Static, hir::Safety),
     /// `type`s from an extern block
     ForeignTypeItem,
     MacroItem(Macro),
@@ -857,8 +863,9 @@ pub(crate) enum ItemKind {
     PrimitiveItem(PrimitiveType),
     /// A required associated constant in a trait declaration.
     TyAssocConstItem(Generics, Box<Type>),
+    ConstantItem(Box<Constant>),
     /// An associated constant in a trait impl or a provided one in a trait declaration.
-    AssocConstItem(Generics, Box<Type>, ConstantKind),
+    AssocConstItem(Box<Constant>),
     /// A required associated type in a trait declaration.
     ///
     /// The bounds may be non-empty if there is a `where` clause.
@@ -891,15 +898,14 @@ impl ItemKind {
             | FunctionItem(_)
             | TestItem(_)
             | TypeAliasItem(_)
-            | OpaqueTyItem(_)
             | StaticItem(_)
             | ConstantItem(_)
             | TraitAliasItem(_)
             | TyMethodItem(_)
             | MethodItem(_, _)
             | StructFieldItem(_)
-            | ForeignFunctionItem(_)
-            | ForeignStaticItem(_)
+            | ForeignFunctionItem(_, _)
+            | ForeignStaticItem(_, _)
             | ForeignTypeItem
             | MacroItem(_)
             | ProcMacroItem(_)
@@ -925,12 +931,11 @@ impl ItemKind {
                 | ExternCrateItem { .. }
                 | FunctionItem(_)
                 | TypeAliasItem(_)
-                | OpaqueTyItem(_)
                 | StaticItem(_)
                 | ConstantItem(_)
                 | TraitAliasItem(_)
-                | ForeignFunctionItem(_)
-                | ForeignStaticItem(_)
+                | ForeignFunctionItem(_, _)
+                | ForeignStaticItem(_, _)
                 | ForeignTypeItem
                 | MacroItem(_)
                 | ProcMacroItem(_)
@@ -953,9 +958,9 @@ pub(crate) trait AttributesExt {
     where
         Self: 'a;
 
-    fn lists<'a>(&'a self, name: Symbol) -> Self::AttributeIterator<'a>;
+    fn lists(&self, name: Symbol) -> Self::AttributeIterator<'_>;
 
-    fn iter<'a>(&'a self) -> Self::Attributes<'a>;
+    fn iter(&self) -> Self::Attributes<'_>;
 
     fn cfg(&self, tcx: TyCtxt<'_>, hidden_cfg: &FxHashSet<Cfg>) -> Option<Arc<Cfg>> {
         let sess = tcx.sess;
@@ -1051,15 +1056,15 @@ impl AttributesExt for [ast::Attribute] {
     type AttributeIterator<'a> = impl Iterator<Item = ast::NestedMetaItem> + 'a;
     type Attributes<'a> = impl Iterator<Item = &'a ast::Attribute> + 'a;
 
-    fn lists<'a>(&'a self, name: Symbol) -> Self::AttributeIterator<'a> {
+    fn lists(&self, name: Symbol) -> Self::AttributeIterator<'_> {
         self.iter()
             .filter(move |attr| attr.has_name(name))
             .filter_map(ast::Attribute::meta_item_list)
             .flatten()
     }
 
-    fn iter<'a>(&'a self) -> Self::Attributes<'a> {
-        self.into_iter()
+    fn iter(&self) -> Self::Attributes<'_> {
+        self.iter()
     }
 }
 
@@ -1069,15 +1074,15 @@ impl AttributesExt for [(Cow<'_, ast::Attribute>, Option<DefId>)] {
     type Attributes<'a> = impl Iterator<Item = &'a ast::Attribute> + 'a
         where Self: 'a;
 
-    fn lists<'a>(&'a self, name: Symbol) -> Self::AttributeIterator<'a> {
+    fn lists(&self, name: Symbol) -> Self::AttributeIterator<'_> {
         AttributesExt::iter(self)
             .filter(move |attr| attr.has_name(name))
             .filter_map(ast::Attribute::meta_item_list)
             .flatten()
     }
 
-    fn iter<'a>(&'a self) -> Self::Attributes<'a> {
-        self.into_iter().map(move |(attr, _)| match attr {
+    fn iter(&self) -> Self::Attributes<'_> {
+        self.iter().map(move |(attr, _)| match attr {
             Cow::Borrowed(attr) => *attr,
             Cow::Owned(attr) => attr,
         })
@@ -1249,6 +1254,8 @@ impl Eq for Attributes {}
 pub(crate) enum GenericBound {
     TraitBound(PolyTrait, hir::TraitBoundModifier),
     Outlives(Lifetime),
+    /// `use<'a, T>` precise-capturing bound syntax
+    Use(Vec<Symbol>),
 }
 
 impl GenericBound {
@@ -1291,7 +1298,7 @@ impl GenericBound {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub(crate) struct Lifetime(pub Symbol);
 
 impl Lifetime {
@@ -1326,7 +1333,7 @@ pub(crate) enum GenericParamDefKind {
     Lifetime { outlives: ThinVec<Lifetime> },
     Type { bounds: ThinVec<GenericBound>, default: Option<Box<Type>>, synthetic: bool },
     // Option<Box<String>> makes this type smaller than `Option<String>` would.
-    Const { ty: Box<Type>, default: Option<Box<String>>, is_host_effect: bool },
+    Const { ty: Box<Type>, default: Option<Box<String>>, synthetic: bool },
 }
 
 impl GenericParamDefKind {
@@ -1350,7 +1357,7 @@ impl GenericParamDef {
     pub(crate) fn is_synthetic_param(&self) -> bool {
         match self.kind {
             GenericParamDefKind::Lifetime { .. } => false,
-            GenericParamDefKind::Const { is_host_effect, .. } => is_host_effect,
+            GenericParamDefKind::Const { synthetic: is_host_effect, .. } => is_host_effect,
             GenericParamDefKind::Type { synthetic, .. } => synthetic,
         }
     }
@@ -1394,8 +1401,8 @@ pub(crate) struct FnDecl {
 }
 
 impl FnDecl {
-    pub(crate) fn self_type(&self) -> Option<SelfTy> {
-        self.inputs.values.get(0).and_then(|v| v.to_self())
+    pub(crate) fn receiver_type(&self) -> Option<&Type> {
+        self.inputs.values.first().and_then(|v| v.to_receiver())
     }
 }
 
@@ -1413,27 +1420,9 @@ pub(crate) struct Argument {
     pub(crate) is_const: bool,
 }
 
-#[derive(Clone, PartialEq, Debug)]
-pub(crate) enum SelfTy {
-    SelfValue,
-    SelfBorrowed(Option<Lifetime>, Mutability),
-    SelfExplicit(Type),
-}
-
 impl Argument {
-    pub(crate) fn to_self(&self) -> Option<SelfTy> {
-        if self.name != kw::SelfLower {
-            return None;
-        }
-        if self.type_.is_self_type() {
-            return Some(SelfValue);
-        }
-        match self.type_ {
-            BorrowedRef { ref lifetime, mutability, ref type_ } if type_.is_self_type() => {
-                Some(SelfBorrowed(lifetime.clone(), mutability))
-            }
-            _ => Some(SelfExplicit(self.type_.clone())),
-        }
+    pub(crate) fn to_receiver(&self) -> Option<&Type> {
+        if self.name == kw::SelfLower { Some(&self.type_) } else { None }
     }
 }
 
@@ -1487,6 +1476,8 @@ pub(crate) enum Type {
     DynTrait(Vec<PolyTrait>, Option<Lifetime>),
     /// A type parameter.
     Generic(Symbol),
+    /// The `Self` type.
+    SelfTy,
     /// A primitive (aka, builtin) type.
     Primitive(PrimitiveType),
     /// A function pointer: `extern "ABI" fn(...) -> ...`
@@ -1524,7 +1515,7 @@ impl Type {
     pub(crate) fn without_borrowed_ref(&self) -> &Type {
         let mut result = self;
         while let Type::BorrowedRef { type_, .. } = result {
-            result = &*type_;
+            result = type_;
         }
         result
     }
@@ -1581,6 +1572,8 @@ impl Type {
             // If both sides are generic, this returns true.
             (_, Type::Generic(_)) => true,
             (Type::Generic(_), _) => false,
+            // `Self` only matches itself.
+            (Type::SelfTy, Type::SelfTy) => true,
             // Paths account for both the path itself and its generics.
             (Type::Path { path: a }, Type::Path { path: b }) => {
                 a.def_id() == b.def_id()
@@ -1651,10 +1644,7 @@ impl Type {
     }
 
     pub(crate) fn is_self_type(&self) -> bool {
-        match *self {
-            Generic(name) => name == kw::SelfUpper,
-            _ => false,
-        }
+        matches!(*self, Type::SelfTy)
     }
 
     pub(crate) fn generic_args(&self) -> Option<&GenericArgs> {
@@ -1687,13 +1677,16 @@ impl Type {
         }
     }
 
-    fn inner_def_id(&self, cache: Option<&Cache>) -> Option<DefId> {
+    /// Use this method to get the [DefId] of a [clean] AST node, including [PrimitiveType]s.
+    ///
+    /// [clean]: crate::clean
+    pub(crate) fn def_id(&self, cache: &Cache) -> Option<DefId> {
         let t: PrimitiveType = match *self {
             Type::Path { ref path } => return Some(path.def_id()),
-            DynTrait(ref bounds, _) => return bounds.get(0).map(|b| b.trait_.def_id()),
-            Primitive(p) => return cache.and_then(|c| c.primitive_locations.get(&p).cloned()),
+            DynTrait(ref bounds, _) => return bounds.first().map(|b| b.trait_.def_id()),
+            Primitive(p) => return cache.primitive_locations.get(&p).cloned(),
             BorrowedRef { type_: box Generic(..), .. } => PrimitiveType::Reference,
-            BorrowedRef { ref type_, .. } => return type_.inner_def_id(cache),
+            BorrowedRef { ref type_, .. } => return type_.def_id(cache),
             Tuple(ref tys) => {
                 if tys.is_empty() {
                     PrimitiveType::Unit
@@ -1706,17 +1699,10 @@ impl Type {
             Array(..) => PrimitiveType::Array,
             Type::Pat(..) => PrimitiveType::Pat,
             RawPointer(..) => PrimitiveType::RawPointer,
-            QPath(box QPathData { ref self_type, .. }) => return self_type.inner_def_id(cache),
-            Generic(_) | Infer | ImplTrait(_) => return None,
+            QPath(box QPathData { ref self_type, .. }) => return self_type.def_id(cache),
+            Generic(_) | SelfTy | Infer | ImplTrait(_) => return None,
         };
-        cache.and_then(|c| Primitive(t).def_id(c))
-    }
-
-    /// Use this method to get the [DefId] of a [clean] AST node, including [PrimitiveType]s.
-    ///
-    /// [clean]: crate::clean
-    pub(crate) fn def_id(&self, cache: &Cache) -> Option<DefId> {
-        self.inner_def_id(Some(cache))
+        Primitive(t).def_id(cache)
     }
 }
 
@@ -1941,7 +1927,7 @@ impl PrimitiveType {
             let mut primitive_locations = FxHashMap::default();
             // NOTE: technically this misses crates that are only passed with `--extern` and not loaded when checking the crate.
             // This is a degenerate case that I don't plan to support.
-            for &crate_num in tcx.crates_including_speculative(()) {
+            for &crate_num in tcx.crates(()) {
                 let e = ExternalCrate { crate_num };
                 let crate_name = e.name(tcx);
                 debug!(?crate_num, ?crate_name);
@@ -2053,7 +2039,7 @@ impl From<hir::PrimTy> for PrimitiveType {
 pub(crate) struct Struct {
     pub(crate) ctor_kind: Option<CtorKind>,
     pub(crate) generics: Generics,
-    pub(crate) fields: Vec<Item>,
+    pub(crate) fields: ThinVec<Item>,
 }
 
 impl Struct {
@@ -2079,7 +2065,7 @@ impl Union {
 /// only as a variant in an enum.
 #[derive(Clone, Debug)]
 pub(crate) struct VariantStruct {
-    pub(crate) fields: Vec<Item>,
+    pub(crate) fields: ThinVec<Item>,
 }
 
 impl VariantStruct {
@@ -2113,7 +2099,7 @@ pub(crate) struct Variant {
 #[derive(Clone, Debug)]
 pub(crate) enum VariantKind {
     CLike,
-    Tuple(Vec<Item>),
+    Tuple(ThinVec<Item>),
     Struct(VariantStruct),
 }
 
@@ -2249,7 +2235,7 @@ impl Path {
 pub(crate) enum GenericArg {
     Lifetime(Lifetime),
     Type(Type),
-    Const(Box<Constant>),
+    Const(Box<ConstantKind>),
     Infer,
 }
 
@@ -2346,12 +2332,6 @@ pub(crate) struct TypeAlias {
     pub(crate) item_type: Option<Type>,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct OpaqueTy {
-    pub(crate) bounds: Vec<GenericBound>,
-    pub(crate) generics: Generics,
-}
-
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub(crate) struct BareFunctionDecl {
     pub(crate) safety: hir::Safety,
@@ -2362,22 +2342,22 @@ pub(crate) struct BareFunctionDecl {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Static {
-    pub(crate) type_: Type,
+    pub(crate) type_: Box<Type>,
     pub(crate) mutability: Mutability,
     pub(crate) expr: Option<BodyId>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Constant {
-    pub(crate) type_: Box<Type>,
     pub(crate) generics: Generics,
     pub(crate) kind: ConstantKind,
+    pub(crate) type_: Type,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Term {
     Type(Type),
-    Constant(Constant),
+    Constant(ConstantKind),
 }
 
 impl Term {
@@ -2400,6 +2380,9 @@ pub(crate) enum ConstantKind {
     /// Note that `ty::Const` includes generic parameters, and may not always be uniquely identified
     /// by a DefId. So this field must be different from `Extern`.
     TyConst { expr: Box<str> },
+    /// A constant that is just a path (i.e., referring to a const param, free const, etc.).
+    // FIXME: this is an unfortunate representation. rustdoc's logic around consts needs to be improved.
+    Path { path: Box<str> },
     /// A constant (expression) that's not an item or associated item. These are usually found
     /// nested inside types (e.g., array lengths) or expressions (e.g., repeat counts), and also
     /// used to define explicit discriminant values for enum variants.
@@ -2428,6 +2411,7 @@ impl ConstantKind {
     pub(crate) fn expr(&self, tcx: TyCtxt<'_>) -> String {
         match *self {
             ConstantKind::TyConst { ref expr } => expr.to_string(),
+            ConstantKind::Path { ref path } => path.to_string(),
             ConstantKind::Extern { def_id } => print_inlined_const(tcx, def_id),
             ConstantKind::Local { body, .. } | ConstantKind::Anonymous { body } => {
                 rendered_const(tcx, tcx.hir().body(body), tcx.hir().body_owner_def_id(body))
@@ -2437,7 +2421,9 @@ impl ConstantKind {
 
     pub(crate) fn value(&self, tcx: TyCtxt<'_>) -> Option<String> {
         match *self {
-            ConstantKind::TyConst { .. } | ConstantKind::Anonymous { .. } => None,
+            ConstantKind::TyConst { .. }
+            | ConstantKind::Path { .. }
+            | ConstantKind::Anonymous { .. } => None,
             ConstantKind::Extern { def_id } | ConstantKind::Local { def_id, .. } => {
                 print_evaluated_const(tcx, def_id, true, true)
             }
@@ -2446,7 +2432,9 @@ impl ConstantKind {
 
     pub(crate) fn is_literal(&self, tcx: TyCtxt<'_>) -> bool {
         match *self {
-            ConstantKind::TyConst { .. } | ConstantKind::Extern { .. } => false,
+            ConstantKind::TyConst { .. }
+            | ConstantKind::Extern { .. }
+            | ConstantKind::Path { .. } => false,
             ConstantKind::Local { body, .. } | ConstantKind::Anonymous { body } => {
                 is_literal_expr(tcx, body.hir_id)
             }
@@ -2472,6 +2460,10 @@ impl Impl {
             .map(|t| t.def_id())
             .map(|did| tcx.provided_trait_methods(did).map(|meth| meth.name).collect())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn is_negative_trait_impl(&self) -> bool {
+        matches!(self.polarity, ty::ImplPolarity::Negative)
     }
 }
 
@@ -2564,7 +2556,7 @@ pub(crate) struct ProcMacro {
 /// * the `A: Bound` in `Trait<A: Bound>`
 /// * the `RetTy` in `Trait(ArgTy, ArgTy) -> RetTy`
 /// * the `C = { Ct }` in `Trait<C = { Ct }>` (feature `associated_const_equality`)
-/// * the `f(): Bound` in `Trait<f(): Bound>` (feature `return_type_notation`)
+/// * the `f(..): Bound` in `Trait<f(..): Bound>` (feature `return_type_notation`)
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub(crate) struct AssocItemConstraint {
     pub(crate) assoc: PathSegment,
@@ -2581,17 +2573,18 @@ pub(crate) enum AssocItemConstraintKind {
 // Some nodes are used a lot. Make sure they don't unintentionally get bigger.
 #[cfg(target_pointer_width = "64")]
 mod size_asserts {
-    use super::*;
     use rustc_data_structures::static_assert_size;
+
+    use super::*;
     // tidy-alphabetical-start
-    static_assert_size!(Crate, 64); // frequently moved by-value
+    static_assert_size!(Crate, 56); // frequently moved by-value
     static_assert_size!(DocFragment, 32);
     static_assert_size!(GenericArg, 32);
     static_assert_size!(GenericArgs, 32);
     static_assert_size!(GenericParamDef, 40);
     static_assert_size!(Generics, 16);
-    static_assert_size!(Item, 56);
-    static_assert_size!(ItemKind, 56);
+    static_assert_size!(Item, 48);
+    static_assert_size!(ItemKind, 48);
     static_assert_size!(PathSegment, 40);
     static_assert_size!(Type, 32);
     // tidy-alphabetical-end

@@ -1,26 +1,29 @@
 //! The main parser interface.
 
+// tidy-alphabetical-start
 #![allow(internal_features)]
 #![allow(rustc::diagnostic_outside_of_impl)]
 #![allow(rustc::untranslatable_diagnostic)]
 #![feature(array_windows)]
+#![feature(assert_matches)]
 #![feature(box_patterns)]
 #![feature(debug_closure_helpers)]
 #![feature(if_let_guard)]
 #![feature(iter_intersperse)]
 #![feature(let_chains)]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
+
+use std::path::Path;
 
 use rustc_ast as ast;
-use rustc_ast::token;
 use rustc_ast::tokenstream::TokenStream;
-use rustc_ast::{AttrItem, Attribute, MetaItem};
+use rustc_ast::{token, AttrItem, Attribute, MetaItem};
 use rustc_ast_pretty::pprust;
 use rustc_data_structures::sync::Lrc;
 use rustc_errors::{Diag, FatalError, PResult};
 use rustc_session::parse::ParseSess;
 use rustc_span::{FileName, SourceFile, Span};
-
-use std::path::Path;
 
 pub const MACRO_ARGUMENTS: Option<&str> = Some("macro arguments");
 
@@ -71,7 +74,7 @@ pub fn new_parser_from_file<'a>(
 ) -> Result<Parser<'a>, Vec<Diag<'a>>> {
     let source_file = psess.source_map().load_file(path).unwrap_or_else(|e| {
         let msg = format!("couldn't read {}: {}", path.display(), e);
-        let mut err = psess.dcx.struct_fatal(msg);
+        let mut err = psess.dcx().struct_fatal(msg);
         if let Some(sp) = sp {
             err.span(sp);
         }
@@ -113,7 +116,7 @@ fn source_file_to_stream<'psess>(
     override_span: Option<Span>,
 ) -> Result<TokenStream, Vec<Diag<'psess>>> {
     let src = source_file.src.as_ref().unwrap_or_else(|| {
-        psess.dcx.bug(format!(
+        psess.dcx().bug(format!(
             "cannot lex `source_file` without source: {}",
             psess.source_map().filename_for_diagnostics(&source_file.name)
         ));
@@ -155,14 +158,14 @@ pub fn fake_token_stream_for_crate(psess: &ParseSess, krate: &ast::Crate) -> Tok
 }
 
 pub fn parse_cfg_attr(
-    attr: &Attribute,
+    cfg_attr: &Attribute,
     psess: &ParseSess,
 ) -> Option<(MetaItem, Vec<(AttrItem, Span)>)> {
     const CFG_ATTR_GRAMMAR_HELP: &str = "#[cfg_attr(condition, attribute, other_attribute, ...)]";
     const CFG_ATTR_NOTE_REF: &str = "for more information, visit \
         <https://doc.rust-lang.org/reference/conditional-compilation.html#the-cfg_attr-attribute>";
 
-    match attr.get_normal_item().args {
+    match cfg_attr.get_normal_item().args {
         ast::AttrArgs::Delimited(ast::DelimArgs { dspan, delim, ref tokens })
             if !tokens.is_empty() =>
         {
@@ -177,8 +180,8 @@ pub fn parse_cfg_attr(
             }
         }
         _ => {
-            psess.dcx.emit_err(errors::MalformedCfgAttr {
-                span: attr.span,
+            psess.dcx().emit_err(errors::MalformedCfgAttr {
+                span: cfg_attr.span,
                 sugg: CFG_ATTR_GRAMMAR_HELP,
             });
         }

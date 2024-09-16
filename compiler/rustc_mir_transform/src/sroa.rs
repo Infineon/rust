@@ -1,4 +1,5 @@
 use rustc_data_structures::flat_map_in_place::FlatMapInPlace;
+use rustc_hir::LangItem;
 use rustc_index::bit_set::{BitSet, GrowableBitSet};
 use rustc_index::IndexVec;
 use rustc_middle::bug;
@@ -8,10 +9,11 @@ use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_mir_dataflow::value_analysis::{excluded_locals, iter_fields};
 use rustc_target::abi::{FieldIdx, FIRST_VARIANT};
+use tracing::{debug, instrument};
 
-pub struct ScalarReplacementOfAggregates;
+pub(super) struct ScalarReplacementOfAggregates;
 
-impl<'tcx> MirPass<'tcx> for ScalarReplacementOfAggregates {
+impl<'tcx> crate::MirPass<'tcx> for ScalarReplacementOfAggregates {
     fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
         sess.mir_opt_level() >= 2
     }
@@ -70,7 +72,7 @@ fn escaping_locals<'tcx>(
                 // Exclude #[repr(simd)] types so that they are not de-optimized into an array
                 return true;
             }
-            if Some(def.did()) == tcx.lang_items().dyn_metadata() {
+            if tcx.is_lang_item(def.did(), LangItem::DynMetadata) {
                 // codegen wants to see the `DynMetadata<T>`,
                 // not the inner reference-to-opaque-type.
                 return true;

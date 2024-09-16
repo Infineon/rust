@@ -1,7 +1,10 @@
 //! A collection of utility functions for the `strip_*` passes.
+
+use std::mem;
+
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::{TyCtxt, Visibility};
-use std::mem;
+use tracing::debug;
 
 use crate::clean::utils::inherits_doc_hidden;
 use crate::clean::{self, Item, ItemId, ItemIdSet};
@@ -36,7 +39,7 @@ fn is_item_reachable(
 
 impl<'a, 'tcx> DocFolder for Stripper<'a, 'tcx> {
     fn fold_item(&mut self, i: Item) -> Option<Item> {
-        match *i.kind {
+        match i.kind {
             clean::StrippedItem(..) => {
                 // We need to recurse into stripped modules to strip things
                 // like impl methods but when doing so we must not add any
@@ -48,8 +51,7 @@ impl<'a, 'tcx> DocFolder for Stripper<'a, 'tcx> {
                 return Some(ret);
             }
             // These items can all get re-exported
-            clean::OpaqueTyItem(..)
-            | clean::TypeAliasItem(..)
+            clean::TypeAliasItem(..)
             | clean::StaticItem(..)
             | clean::StructItem(..)
             | clean::EnumItem(..)
@@ -95,7 +97,14 @@ impl<'a, 'tcx> DocFolder for Stripper<'a, 'tcx> {
             }
 
             clean::ModuleItem(..) => {
-                if i.item_id.is_local() && i.visibility(self.tcx) != Some(Visibility::Public) {
+                if i.item_id.is_local()
+                    && !is_item_reachable(
+                        self.tcx,
+                        self.is_json_output,
+                        self.effective_visibilities,
+                        i.item_id,
+                    )
+                {
                     debug!("Stripper: stripping module {:?}", i.name);
                     let old = mem::replace(&mut self.update_retained, false);
                     let ret = strip_item(self.fold_item_recur(i));
@@ -122,7 +131,7 @@ impl<'a, 'tcx> DocFolder for Stripper<'a, 'tcx> {
             clean::KeywordItem => {}
         }
 
-        let fastreturn = match *i.kind {
+        let fastreturn = match i.kind {
             // nothing left to do for traits (don't want to filter their
             // methods out, visibility controlled by the trait)
             clean::TraitItem(..) => true,
@@ -187,7 +196,7 @@ impl<'a> ImplStripper<'a, '_> {
 
 impl<'a> DocFolder for ImplStripper<'a, '_> {
     fn fold_item(&mut self, i: Item) -> Option<Item> {
-        if let clean::ImplItem(ref imp) = *i.kind {
+        if let clean::ImplItem(ref imp) = i.kind {
             // Impl blocks can be skipped if they are: empty; not a trait impl; and have no
             // documentation.
             //
@@ -264,7 +273,7 @@ impl<'tcx> ImportStripper<'tcx> {
 
 impl<'tcx> DocFolder for ImportStripper<'tcx> {
     fn fold_item(&mut self, i: Item) -> Option<Item> {
-        match *i.kind {
+        match &i.kind {
             clean::ImportItem(imp)
                 if !self.document_hidden && self.import_should_be_hidden(&i, &imp) =>
             {

@@ -4,15 +4,17 @@
 use std::borrow::Cow;
 
 use rustc_ast::util::unicode::TEXT_FLOW_CONTROL_CHARS;
-use rustc_errors::elided_lifetime_in_path_suggestion;
-use rustc_errors::{Applicability, Diag, DiagArgValue, LintDiagnostic};
+use rustc_errors::{
+    elided_lifetime_in_path_suggestion, Applicability, Diag, DiagArgValue, LintDiagnostic,
+};
 use rustc_middle::middle::stability;
-use rustc_session::lint::BuiltinLintDiag;
+use rustc_session::lint::{BuiltinLintDiag, ElidedLifetimeResolution};
 use rustc_session::Session;
+use rustc_span::symbol::kw;
 use rustc_span::BytePos;
 use tracing::debug;
 
-use crate::lints;
+use crate::lints::{self, ElidedNamedLifetime};
 
 mod check_cfg;
 
@@ -170,6 +172,10 @@ pub(super) fn decorate_lint(sess: &Session, diagnostic: BuiltinLintDiag, diag: &
             }
             .decorate_lint(diag);
         }
+        BuiltinLintDiag::RawPrefix(label_span) => {
+            lints::RawPrefix { label: label_span, suggestion: label_span.shrink_to_hi() }
+                .decorate_lint(diag);
+        }
         BuiltinLintDiag::UnusedBuiltinAttribute { attr_name, macro_name, invoc_span } => {
             lints::UnusedBuiltinAttribute { invoc_span, attr_name, macro_name }.decorate_lint(diag);
         }
@@ -201,6 +207,9 @@ pub(super) fn decorate_lint(sess: &Session, diagnostic: BuiltinLintDiag, diag: &
                 None => lints::DeprecatedWhereClauseLocationSugg::RemoveWhere { span: left_sp },
             };
             lints::DeprecatedWhereClauseLocation { suggestion }.decorate_lint(diag);
+        }
+        BuiltinLintDiag::MissingUnsafeOnExtern { suggestion } => {
+            lints::MissingUnsafeOnExtern { suggestion }.decorate_lint(diag);
         }
         BuiltinLintDiag::SingleUseLifetime {
             param_span,
@@ -316,11 +325,30 @@ pub(super) fn decorate_lint(sess: &Session, diagnostic: BuiltinLintDiag, diag: &
         BuiltinLintDiag::UnusedQualifications { removal_span } => {
             lints::UnusedQualifications { removal_span }.decorate_lint(diag);
         }
-        BuiltinLintDiag::AssociatedConstElidedLifetime { elided, span: lt_span } => {
+        BuiltinLintDiag::UnsafeAttrOutsideUnsafe {
+            attribute_name_span,
+            sugg_spans: (left, right),
+        } => {
+            lints::UnsafeAttrOutsideUnsafe {
+                span: attribute_name_span,
+                suggestion: lints::UnsafeAttrOutsideUnsafeSuggestion { left, right },
+            }
+            .decorate_lint(diag);
+        }
+        BuiltinLintDiag::AssociatedConstElidedLifetime {
+            elided,
+            span: lt_span,
+            lifetimes_in_scope,
+        } => {
             let lt_span = if elided { lt_span.shrink_to_hi() } else { lt_span };
             let code = if elided { "'static " } else { "'static" };
-            lints::AssociatedConstElidedLifetime { span: lt_span, code, elided }
-                .decorate_lint(diag);
+            lints::AssociatedConstElidedLifetime {
+                span: lt_span,
+                code,
+                elided,
+                lifetimes_in_scope,
+            }
+            .decorate_lint(diag);
         }
         BuiltinLintDiag::RedundantImportVisibility { max_vis, span: vis_span, import_vis } => {
             lints::RedundantImportVisibility { span: vis_span, help: (), max_vis, import_vis }
@@ -337,8 +365,9 @@ pub(super) fn decorate_lint(sess: &Session, diagnostic: BuiltinLintDiag, diag: &
             lints::MacroUseDeprecated.decorate_lint(diag);
         }
         BuiltinLintDiag::UnusedMacroUse => lints::UnusedMacroUse.decorate_lint(diag),
-        BuiltinLintDiag::PrivateExternCrateReexport(ident) => {
-            lints::PrivateExternCrateReexport { ident }.decorate_lint(diag);
+        BuiltinLintDiag::PrivateExternCrateReexport { source: ident, extern_crate_span } => {
+            lints::PrivateExternCrateReexport { ident, sugg: extern_crate_span.shrink_to_lo() }
+                .decorate_lint(diag);
         }
         BuiltinLintDiag::UnusedLabel => lints::UnusedLabel.decorate_lint(diag),
         BuiltinLintDiag::MacroIsPrivate(ident) => {
@@ -411,5 +440,22 @@ pub(super) fn decorate_lint(sess: &Session, diagnostic: BuiltinLintDiag, diag: &
             lints::InnerAttributeUnstable::CustomInnerAttribute
         }
         .decorate_lint(diag),
+        BuiltinLintDiag::OutOfScopeMacroCalls { path } => {
+            lints::OutOfScopeMacroCalls { path }.decorate_lint(diag)
+        }
+        BuiltinLintDiag::UnexpectedBuiltinCfg { cfg, cfg_name, controlled_by } => {
+            lints::UnexpectedBuiltinCfg { cfg, cfg_name, controlled_by }.decorate_lint(diag)
+        }
+        BuiltinLintDiag::ElidedNamedLifetimes { elided: (span, kind), resolution } => {
+            match resolution {
+                ElidedLifetimeResolution::Static => {
+                    ElidedNamedLifetime { span, kind, name: kw::StaticLifetime, declaration: None }
+                }
+                ElidedLifetimeResolution::Param(name, declaration) => {
+                    ElidedNamedLifetime { span, kind, name, declaration: Some(declaration) }
+                }
+            }
+            .decorate_lint(diag)
+        }
     }
 }

@@ -13,10 +13,10 @@ use crate::*;
 pub struct UnixEnvVars<'tcx> {
     /// Stores pointers to the environment variables. These variables must be stored as
     /// null-terminated target strings (c_str or wide_str) with the `"{name}={value}"` format.
-    map: FxHashMap<OsString, Pointer<Option<Provenance>>>,
+    map: FxHashMap<OsString, Pointer>,
 
     /// Place where the `environ` static is stored. Lazily initialized, but then never changes.
-    environ: MPlaceTy<'tcx, Provenance>,
+    environ: MPlaceTy<'tcx>,
 }
 
 impl VisitProvenance for UnixEnvVars<'_> {
@@ -65,7 +65,7 @@ impl<'tcx> UnixEnvVars<'tcx> {
         Ok(())
     }
 
-    pub(crate) fn environ(&self) -> Pointer<Option<Provenance>> {
+    pub(crate) fn environ(&self) -> Pointer {
         self.environ.ptr()
     }
 
@@ -73,7 +73,7 @@ impl<'tcx> UnixEnvVars<'tcx> {
         &self,
         ecx: &InterpCx<'tcx, MiriMachine<'tcx>>,
         name: &OsStr,
-    ) -> InterpResult<'tcx, Option<Pointer<Option<Provenance>>>> {
+    ) -> InterpResult<'tcx, Option<Pointer>> {
         // We don't care about the value as we have the `map` to keep track of everything,
         // but we do want to do this read so it shows up as a data race.
         let _vars_ptr = ecx.read_pointer(&self.environ)?;
@@ -81,10 +81,10 @@ impl<'tcx> UnixEnvVars<'tcx> {
             return Ok(None);
         };
         // The offset is used to strip the "{name}=" part of the string.
-        let var_ptr = var_ptr.offset(
-            Size::from_bytes(u64::try_from(name.len()).unwrap().checked_add(1).unwrap()),
+        let var_ptr = var_ptr.wrapping_offset(
+            Size::from_bytes(u64::try_from(name.len()).unwrap().strict_add(1)),
             ecx,
-        )?;
+        );
         Ok(Some(var_ptr))
     }
 
@@ -109,7 +109,7 @@ fn alloc_env_var<'tcx>(
     ecx: &mut InterpCx<'tcx, MiriMachine<'tcx>>,
     name: &OsStr,
     value: &OsStr,
-) -> InterpResult<'tcx, Pointer<Option<Provenance>>> {
+) -> InterpResult<'tcx, Pointer> {
     let mut name_osstring = name.to_os_string();
     name_osstring.push("=");
     name_osstring.push(value);
@@ -119,8 +119,8 @@ fn alloc_env_var<'tcx>(
 /// Allocates an `environ` block with the given list of pointers.
 fn alloc_environ_block<'tcx>(
     ecx: &mut InterpCx<'tcx, MiriMachine<'tcx>>,
-    mut vars: Vec<Pointer<Option<Provenance>>>,
-) -> InterpResult<'tcx, Pointer<Option<Provenance>>> {
+    mut vars: Vec<Pointer>,
+) -> InterpResult<'tcx, Pointer> {
     // Add trailing null.
     vars.push(Pointer::null());
     // Make an array with all these pointers inside Miri.
@@ -139,10 +139,7 @@ fn alloc_environ_block<'tcx>(
 
 impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
 pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
-    fn getenv(
-        &mut self,
-        name_op: &OpTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, Pointer<Option<Provenance>>> {
+    fn getenv(&mut self, name_op: &OpTy<'tcx>) -> InterpResult<'tcx, Pointer> {
         let this = self.eval_context_mut();
         this.assert_target_os_is_unix("getenv");
 
@@ -155,9 +152,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
     fn setenv(
         &mut self,
-        name_op: &OpTy<'tcx, Provenance>,
-        value_op: &OpTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, i32> {
+        name_op: &OpTy<'tcx>,
+        value_op: &OpTy<'tcx>,
+    ) -> InterpResult<'tcx, Scalar> {
         let this = self.eval_context_mut();
         this.assert_target_os_is_unix("setenv");
 
@@ -178,16 +175,16 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.deallocate_ptr(var, None, MiriMemoryKind::Runtime.into())?;
             }
             this.update_environ()?;
-            Ok(0) // return zero on success
+            Ok(Scalar::from_i32(0)) // return zero on success
         } else {
             // name argument is a null pointer, points to an empty string, or points to a string containing an '=' character.
             let einval = this.eval_libc("EINVAL");
             this.set_last_error(einval)?;
-            Ok(-1)
+            Ok(Scalar::from_i32(-1))
         }
     }
 
-    fn unsetenv(&mut self, name_op: &OpTy<'tcx, Provenance>) -> InterpResult<'tcx, i32> {
+    fn unsetenv(&mut self, name_op: &OpTy<'tcx>) -> InterpResult<'tcx, Scalar> {
         let this = self.eval_context_mut();
         this.assert_target_os_is_unix("unsetenv");
 
@@ -204,20 +201,16 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.deallocate_ptr(var, None, MiriMemoryKind::Runtime.into())?;
             }
             this.update_environ()?;
-            Ok(0)
+            Ok(Scalar::from_i32(0))
         } else {
             // name argument is a null pointer, points to an empty string, or points to a string containing an '=' character.
             let einval = this.eval_libc("EINVAL");
             this.set_last_error(einval)?;
-            Ok(-1)
+            Ok(Scalar::from_i32(-1))
         }
     }
 
-    fn getcwd(
-        &mut self,
-        buf_op: &OpTy<'tcx, Provenance>,
-        size_op: &OpTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, Pointer<Option<Provenance>>> {
+    fn getcwd(&mut self, buf_op: &OpTy<'tcx>, size_op: &OpTy<'tcx>) -> InterpResult<'tcx, Pointer> {
         let this = self.eval_context_mut();
         this.assert_target_os_is_unix("getcwd");
 
@@ -245,7 +238,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         Ok(Pointer::null())
     }
 
-    fn chdir(&mut self, path_op: &OpTy<'tcx, Provenance>) -> InterpResult<'tcx, i32> {
+    fn chdir(&mut self, path_op: &OpTy<'tcx>) -> InterpResult<'tcx, Scalar> {
         let this = self.eval_context_mut();
         this.assert_target_os_is_unix("chdir");
 
@@ -255,16 +248,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             this.reject_in_isolation("`chdir`", reject_with)?;
             this.set_last_error_from_io_error(ErrorKind::PermissionDenied.into())?;
 
-            return Ok(-1);
+            return Ok(Scalar::from_i32(-1));
         }
 
-        match env::set_current_dir(path) {
-            Ok(()) => Ok(0),
-            Err(e) => {
-                this.set_last_error_from_io_error(e)?;
-                Ok(-1)
-            }
-        }
+        let result = env::set_current_dir(path).map(|()| 0);
+        Ok(Scalar::from_i32(this.try_unwrap_io_result(result)?))
     }
 
     /// Updates the `environ` static.
@@ -283,16 +271,26 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         Ok(())
     }
 
-    fn getpid(&mut self) -> InterpResult<'tcx, i32> {
+    fn getpid(&mut self) -> InterpResult<'tcx, Scalar> {
         let this = self.eval_context_mut();
         this.assert_target_os_is_unix("getpid");
-
-        this.check_no_isolation("`getpid`")?;
 
         // The reason we need to do this wacky of a conversion is because
         // `libc::getpid` returns an i32, however, `std::process::id()` return an u32.
         // So we un-do the conversion that stdlib does and turn it back into an i32.
-        #[allow(clippy::cast_possible_wrap)]
-        Ok(std::process::id() as i32)
+        // In `Scalar` representation, these are the same, so we don't need to anything else.
+        Ok(Scalar::from_u32(this.get_pid()))
+    }
+
+    fn linux_gettid(&mut self) -> InterpResult<'tcx, Scalar> {
+        let this = self.eval_context_ref();
+        this.assert_target_os("linux", "gettid");
+
+        let index = this.machine.threads.active_thread().to_u32();
+
+        // Compute a TID for this thread, ensuring that the main thread has PID == TID.
+        let tid = this.get_pid().strict_add(index);
+
+        Ok(Scalar::from_u32(tid))
     }
 }

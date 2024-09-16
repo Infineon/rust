@@ -133,6 +133,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 .expect_const()
                 .eval(fx.tcx, ty::ParamEnv::reveal_all(), span)
                 .unwrap()
+                .1
                 .unwrap_branch();
 
             assert_eq!(x.layout(), y.layout());
@@ -146,8 +147,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
 
             let total_len = lane_count * 2;
 
-            let indexes =
-                idx.iter().map(|idx| idx.unwrap_leaf().try_to_u32().unwrap()).collect::<Vec<u32>>();
+            let indexes = idx.iter().map(|idx| idx.unwrap_leaf().to_u32()).collect::<Vec<u32>>();
 
             for &idx in &indexes {
                 assert!(u64::from(idx) < total_len, "idx {} out of range 0..{}", idx, total_len);
@@ -180,26 +180,20 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 return;
             }
 
-            // Make sure this is actually an array, since typeck only checks the length-suffixed
-            // version of this intrinsic.
+            // Make sure this is actually a SIMD vector.
             let idx_ty = fx.monomorphize(idx.node.ty(fx.mir, fx.tcx));
-            let n: u16 = match idx_ty.kind() {
-                ty::Array(ty, len) if matches!(ty.kind(), ty::Uint(ty::UintTy::U32)) => len
-                    .try_eval_target_usize(fx.tcx, ty::ParamEnv::reveal_all())
-                    .unwrap_or_else(|| {
-                        span_bug!(span, "could not evaluate shuffle index array length")
-                    })
-                    .try_into()
-                    .unwrap(),
-                _ => {
-                    fx.tcx.dcx().span_err(
-                        span,
-                        format!("simd_shuffle index must be an array of `u32`, got `{}`", idx_ty),
-                    );
-                    // Prevent verifier error
-                    fx.bcx.ins().trap(TrapCode::UnreachableCodeReached);
-                    return;
-                }
+            let n: u16 = if idx_ty.is_simd()
+                && matches!(idx_ty.simd_size_and_type(fx.tcx).1.kind(), ty::Uint(ty::UintTy::U32))
+            {
+                idx_ty.simd_size_and_type(fx.tcx).0.try_into().unwrap()
+            } else {
+                fx.tcx.dcx().span_err(
+                    span,
+                    format!("simd_shuffle index must be a SIMD vector of `u32`, got `{}`", idx_ty),
+                );
+                // Prevent verifier error
+                fx.bcx.ins().trap(TrapCode::UnreachableCodeReached);
+                return;
             };
 
             assert_eq!(x.layout(), y.layout());
@@ -213,6 +207,8 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
 
             let total_len = lane_count * 2;
 
+            // FIXME: this is a terrible abstraction-breaking hack.
+            // Find a way to reuse `immediate_const_vector` from `codegen_ssa` instead.
             let indexes = {
                 use rustc_middle::mir::interpret::*;
                 let idx_const = match &idx.node {
@@ -281,9 +277,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 fx.tcx.dcx().span_fatal(span, "Index argument for `simd_insert` is not a constant");
             };
 
-            let idx: u32 = idx_const
-                .try_to_u32()
-                .unwrap_or_else(|_| panic!("kind not scalar: {:?}", idx_const));
+            let idx: u32 = idx_const.to_u32();
             let (lane_count, _lane_ty) = base.layout().ty.simd_size_and_type(fx.tcx);
             if u64::from(idx) >= lane_count {
                 fx.tcx.dcx().span_fatal(
@@ -329,9 +323,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 return;
             };
 
-            let idx = idx_const
-                .try_to_u32()
-                .unwrap_or_else(|_| panic!("kind not scalar: {:?}", idx_const));
+            let idx = idx_const.to_u32();
             let (lane_count, _lane_ty) = v.layout().ty.simd_size_and_type(fx.tcx);
             if u64::from(idx) >= lane_count {
                 fx.tcx.dcx().span_fatal(

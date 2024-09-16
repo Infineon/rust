@@ -7,7 +7,7 @@ use super::sync::EvalContextExtPriv as _;
 use super::vector_clock::VClock;
 use crate::*;
 
-declare_id!(InitOnceId);
+super::sync::declare_id!(InitOnceId);
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
 /// The current status of a one time initialization.
@@ -26,42 +26,23 @@ pub(super) struct InitOnce {
     clock: VClock,
 }
 
-impl<'tcx> EvalContextExtPriv<'tcx> for crate::MiriInterpCx<'tcx> {}
-trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
-    /// Provides the closure with the next InitOnceId. Creates that InitOnce if the closure returns None,
-    /// otherwise returns the value from the closure.
-    #[inline]
-    fn init_once_get_or_create<F>(&mut self, existing: F) -> InterpResult<'tcx, InitOnceId>
-    where
-        F: FnOnce(
-            &mut MiriInterpCx<'tcx>,
-            InitOnceId,
-        ) -> InterpResult<'tcx, Option<InitOnceId>>,
-    {
-        let this = self.eval_context_mut();
-        let next_index = this.machine.sync.init_onces.next_index();
-        if let Some(old) = existing(this, next_index)? {
-            Ok(old)
-        } else {
-            let new_index = this.machine.sync.init_onces.push(Default::default());
-            assert_eq!(next_index, new_index);
-            Ok(new_index)
-        }
-    }
-}
-
 impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
 pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn init_once_get_or_create_id(
         &mut self,
-        lock_op: &OpTy<'tcx, Provenance>,
+        lock_op: &OpTy<'tcx>,
         lock_layout: TyAndLayout<'tcx>,
         offset: u64,
     ) -> InterpResult<'tcx, InitOnceId> {
         let this = self.eval_context_mut();
-        this.init_once_get_or_create(|ecx, next_id| {
-            ecx.get_or_create_id(next_id, lock_op, lock_layout, offset)
-        })
+        this.get_or_create_id(
+            lock_op,
+            lock_layout,
+            offset,
+            |ecx| &mut ecx.machine.sync.init_onces,
+            |_| Ok(Default::default()),
+        )?
+        .ok_or_else(|| err_ub_format!("init_once has invalid ID").into())
     }
 
     #[inline]

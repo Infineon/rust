@@ -1,6 +1,6 @@
 use crate::spec::{base, LinkerFlavor, Lld, Target};
 
-pub fn target() -> Target {
+pub(crate) fn target() -> Target {
     let mut base = base::windows_msvc::opts();
     base.cpu = "pentium4".into();
     base.max_atomic_width = Some(64);
@@ -22,10 +22,10 @@ pub fn target() -> Target {
     Target {
         llvm_target: "i686-pc-windows-msvc".into(),
         metadata: crate::spec::TargetMetadata {
-            description: None,
-            tier: None,
-            host_tools: None,
-            std: None,
+            description: Some("32-bit Windows 7 support".into()),
+            tier: Some(3),
+            host_tools: Some(false),
+            std: Some(true),
         },
         pointer_width: 32,
         data_layout: "e-m:x-p:32:32-p270:32:32-p271:32:32-p272:64:64-\

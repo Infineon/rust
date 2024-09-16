@@ -4,6 +4,7 @@ use std::rc::Rc;
 use rustc_ast::{ast, token::Delimiter, visit};
 use rustc_data_structures::sync::Lrc;
 use rustc_span::{symbol, BytePos, Pos, Span};
+use tracing::debug;
 
 use crate::attr::*;
 use crate::comment::{contains_comment, rewrite_comment, CodeCharKind, CommentCodeSlices};
@@ -81,7 +82,7 @@ pub(crate) struct FmtVisitor<'a> {
     pub(crate) snippet_provider: &'a SnippetProvider,
     pub(crate) line_number: usize,
     /// List of 1-based line ranges which were annotated with skip
-    /// Both bounds are inclusifs.
+    /// Both bounds are inclusive.
     pub(crate) skipped_range: Rc<RefCell<Vec<(usize, usize)>>>,
     pub(crate) macro_rewrite_failure: bool,
     pub(crate) report: FormatReport,

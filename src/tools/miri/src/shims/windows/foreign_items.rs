@@ -82,8 +82,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         &mut self,
         link_name: Symbol,
         abi: Abi,
-        args: &[OpTy<'tcx, Provenance>],
-        dest: &MPlaceTy<'tcx, Provenance>,
+        args: &[OpTy<'tcx>],
+        dest: &MPlaceTy<'tcx>,
     ) -> InterpResult<'tcx, EmulateItemResult> {
         let this = self.eval_context_mut();
 
@@ -136,6 +136,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let [token, buf, size] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
                 let result = this.GetUserProfileDirectoryW(token, buf, size)?;
+                this.write_scalar(result, dest)?;
+            }
+            "GetCurrentProcessId" => {
+                let [] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+                let result = this.GetCurrentProcessId()?;
                 this.write_scalar(result, dest)?;
             }
 
@@ -367,7 +372,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.machine.tls.store_tls(key, active_thread, new_data, &*this.tcx)?;
 
                 // Return success (`1`).
-                this.write_scalar(Scalar::from_i32(1), dest)?;
+                this.write_int(1, dest)?;
             }
 
             // Access to command-line arguments
@@ -558,7 +563,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let ptr = this.read_pointer(ptr)?;
                 let len = this.read_target_usize(len)?;
                 this.gen_random(ptr, len)?;
-                this.write_scalar(Scalar::from_i32(1), dest)?;
+                this.write_int(1, dest)?;
             }
             "BCryptGenRandom" => {
                 // used by getrandom 0.2
@@ -622,7 +627,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
                 this.CloseHandle(handle)?;
 
-                this.write_scalar(Scalar::from_u32(1), dest)?;
+                this.write_int(1, dest)?;
             }
             "GetModuleFileNameW" => {
                 let [handle, filename, size] =
@@ -647,7 +652,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     // If the function succeeds, the return value is the length of the string that
                     // is copied to the buffer, in characters, not including the terminating null
                     // character.
-                    this.write_int(size_needed.checked_sub(1).unwrap(), dest)?;
+                    this.write_int(size_needed.strict_sub(1), dest)?;
                 } else {
                     // If the buffer is too small to hold the module name, the string is truncated
                     // to nSize characters including the terminating null character, the function
@@ -689,7 +694,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     throw_unsup_format!("FormatMessageW: buffer not big enough");
                 }
                 // The return value is the number of characters stored *excluding* the null terminator.
-                this.write_int(length.checked_sub(1).unwrap(), dest)?;
+                this.write_int(length.strict_sub(1), dest)?;
             }
 
             // Incomplete shims that we "stub out" just to get pre-main initialization code to work.
@@ -743,11 +748,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // Any non zero value works for the stdlib. This is just used for stack overflows anyway.
                 this.write_int(1, dest)?;
             }
-            "GetCurrentProcessId" if this.frame_in_std() => {
-                let [] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                let result = this.GetCurrentProcessId()?;
-                this.write_int(result, dest)?;
-            }
             // this is only callable from std because we know that std ignores the return value
             "SwitchToThread" if this.frame_in_std() => {
                 let [] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
@@ -756,6 +756,22 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
                 // FIXME: this should return a nonzero value if this call does result in switching to another thread.
                 this.write_null(dest)?;
+            }
+
+            "_Unwind_RaiseException" => {
+                // This is not formally part of POSIX, but it is very wide-spread on POSIX systems.
+                // It was originally specified as part of the Itanium C++ ABI:
+                // https://itanium-cxx-abi.github.io/cxx-abi/abi-eh.html#base-throw.
+                // MinGW implements _Unwind_RaiseException on top of SEH exceptions.
+                if this.tcx.sess.target.env != "gnu" {
+                    throw_unsup_format!(
+                        "`_Unwind_RaiseException` is not supported on non-MinGW Windows",
+                    );
+                }
+                // This function looks and behaves excatly like miri_start_unwind.
+                let [payload] = this.check_shim(abi, Abi::C { unwind: true }, link_name, args)?;
+                this.handle_miri_start_unwind(payload)?;
+                return Ok(EmulateItemResult::NeedsUnwind);
             }
 
             _ => return Ok(EmulateItemResult::NotSupported),

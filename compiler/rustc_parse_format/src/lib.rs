@@ -4,24 +4,25 @@
 //! Parsing does not happen at runtime: structures of `std::fmt::rt` are
 //! generated instead.
 
+// tidy-alphabetical-start
+// We want to be able to build this crate with a stable compiler,
+// so no `#![feature]` attributes should be added.
+#![deny(unstable_features)]
 #![doc(
     html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/",
     html_playground_url = "https://play.rust-lang.org/",
     test(attr(deny(warnings)))
 )]
-// We want to be able to build this crate with a stable compiler,
-// so no `#![feature]` attributes should be added.
-#![deny(unstable_features)]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
+
+use std::{iter, str, string};
 
 use rustc_lexer::unescape;
 pub use Alignment::*;
 pub use Count::*;
 pub use Piece::*;
 pub use Position::*;
-
-use std::iter;
-use std::str;
-use std::string;
 
 // Note: copied from rustc_span
 /// Range inside of a `Span` used for diagnostics when we only have access to relative positions.

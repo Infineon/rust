@@ -10,18 +10,14 @@
 use std::marker::PhantomData;
 use std::ops::Range;
 
-use rustc_middle::mir;
-use rustc_middle::ty;
 use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::Ty;
-use rustc_middle::{bug, span_bug};
-use rustc_target::abi::Size;
-use rustc_target::abi::{self, VariantIdx};
-
+use rustc_middle::{bug, mir, span_bug, ty};
+use rustc_target::abi::{self, Size, VariantIdx};
 use tracing::{debug, instrument};
 
 use super::{
-    throw_ub, throw_unsup_format, InterpCx, InterpResult, MPlaceTy, Machine, MemPlaceMeta, OpTy,
+    err_ub, throw_ub, throw_unsup, InterpCx, InterpResult, MPlaceTy, Machine, MemPlaceMeta, OpTy,
     Provenance, Scalar,
 };
 
@@ -81,6 +77,8 @@ pub trait Projectable<'tcx, Prov: Provenance>: Sized + std::fmt::Debug {
         ecx: &InterpCx<'tcx, M>,
     ) -> InterpResult<'tcx, Self> {
         assert!(layout.is_sized());
+        // We sometimes do pointer arithmetic with this function, disregarding the source type.
+        // So we don't check the sizes here.
         self.offset_with_meta(offset, OffsetMode::Inbounds, MemPlaceMeta::None, layout, ecx)
     }
 
@@ -103,7 +101,7 @@ pub trait Projectable<'tcx, Prov: Provenance>: Sized + std::fmt::Debug {
 }
 
 /// A type representing iteration over the elements of an array.
-pub struct ArrayIterator<'tcx, 'a, Prov: Provenance, P: Projectable<'tcx, Prov>> {
+pub struct ArrayIterator<'a, 'tcx, Prov: Provenance, P: Projectable<'tcx, Prov>> {
     base: &'a P,
     range: Range<u64>,
     stride: Size,
@@ -111,7 +109,7 @@ pub struct ArrayIterator<'tcx, 'a, Prov: Provenance, P: Projectable<'tcx, Prov>>
     _phantom: PhantomData<Prov>, // otherwise it says `Prov` is never used...
 }
 
-impl<'tcx, 'a, Prov: Provenance, P: Projectable<'tcx, Prov>> ArrayIterator<'tcx, 'a, Prov, P> {
+impl<'a, 'tcx, Prov: Provenance, P: Projectable<'tcx, Prov>> ArrayIterator<'a, 'tcx, Prov, P> {
     /// Should be the same `ecx` on each call, and match the one used to create the iterator.
     pub fn next<M: Machine<'tcx, Provenance = Prov>>(
         &mut self,
@@ -184,8 +182,8 @@ where
                     (base_meta, offset)
                 }
                 None => {
-                    // We don't know the alignment of this field, so we cannot adjust.
-                    throw_unsup_format!("`extern type` does not have a known offset")
+                    // We cannot know the alignment of this field, so we cannot adjust.
+                    throw_unsup!(ExternTypeField)
                 }
             }
         } else {
@@ -231,7 +229,11 @@ where
                     // This can only be reached in ConstProp and non-rustc-MIR.
                     throw_ub!(BoundsCheckFailed { len, index });
                 }
-                let offset = stride * index; // `Size` multiplication
+                // With raw slices, `len` can be so big that this *can* overflow.
+                let offset = self
+                    .compute_size_in_bytes(stride, index)
+                    .ok_or_else(|| err_ub!(PointerArithOverflow))?;
+
                 // All fields have the same layout.
                 let field_layout = base.layout().field(self, 0);
                 (offset, field_layout)
@@ -244,6 +246,19 @@ where
         };
 
         base.offset(offset, field_layout, self)
+    }
+
+    /// Converts a repr(simd) value into an array of the right size, such that `project_index`
+    /// accesses the SIMD elements. Also returns the number of elements.
+    pub fn project_to_simd<P: Projectable<'tcx, M::Provenance>>(
+        &self,
+        base: &P,
+    ) -> InterpResult<'tcx, (P, u64)> {
+        assert!(base.layout().ty.ty_adt_def().unwrap().repr().simd());
+        // SIMD types must be newtypes around arrays, so all we have to do is project to their only field.
+        let array = self.project_field(base, 0)?;
+        let len = array.len(self)?;
+        Ok((array, len))
     }
 
     fn project_constant_index<P: Projectable<'tcx, M::Provenance>>(
@@ -275,7 +290,7 @@ where
     pub fn project_array_fields<'a, P: Projectable<'tcx, M::Provenance>>(
         &self,
         base: &'a P,
-    ) -> InterpResult<'tcx, ArrayIterator<'tcx, 'a, M::Provenance, P>> {
+    ) -> InterpResult<'tcx, ArrayIterator<'a, 'tcx, M::Provenance, P>> {
         let abi::FieldsShape::Array { stride, .. } = base.layout().fields else {
             span_bug!(self.cur_span(), "project_array_fields: expected an array layout");
         };
@@ -298,7 +313,7 @@ where
     ) -> InterpResult<'tcx, P> {
         let len = base.len(self)?; // also asserts that we have a type where this makes sense
         let actual_to = if from_end {
-            if from.checked_add(to).map_or(true, |to| to > len) {
+            if from.checked_add(to).is_none_or(|to| to > len) {
                 // This can only be reached in ConstProp and non-rustc-MIR.
                 throw_ub!(BoundsCheckFailed { len: len, index: from.saturating_add(to) });
             }

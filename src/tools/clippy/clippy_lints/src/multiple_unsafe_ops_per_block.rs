@@ -1,5 +1,5 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::visitors::{for_each_expr_with_closures, Descend, Visitable};
+use clippy_utils::visitors::{for_each_expr, Descend, Visitable};
 use core::ops::ControlFlow::Continue;
 use hir::def::{DefKind, Res};
 use hir::{BlockCheckMode, ExprKind, QPath, Safety, UnOp};
@@ -96,7 +96,7 @@ fn collect_unsafe_exprs<'tcx>(
     node: impl Visitable<'tcx>,
     unsafe_ops: &mut Vec<(&'static str, Span)>,
 ) {
-    for_each_expr_with_closures(cx, node, |expr| {
+    for_each_expr(cx, node, |expr| {
         match expr.kind {
             ExprKind::InlineAsm(_) => unsafe_ops.push(("inline assembly used here", expr.span)),
 
@@ -130,7 +130,7 @@ fn collect_unsafe_exprs<'tcx>(
             ExprKind::Call(path_expr, _) => {
                 let sig = match *cx.typeck_results().expr_ty(path_expr).kind() {
                     ty::FnDef(id, _) => cx.tcx.fn_sig(id).skip_binder(),
-                    ty::FnPtr(sig) => sig,
+                    ty::FnPtr(sig_tys, hdr) => sig_tys.with(hdr),
                     _ => return Continue(Descend::Yes),
                 };
                 if sig.safety() == Safety::Unsafe {

@@ -1,3 +1,4 @@
+use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint;
 use rustc_ast::ast;
 use rustc_data_structures::fx::FxHashSet;
@@ -44,19 +45,20 @@ declare_clippy_lint! {
     "usage of non-allowed Unicode scripts"
 }
 
-#[derive(Clone, Debug)]
 pub struct DisallowedScriptIdents {
     whitelist: FxHashSet<Script>,
 }
 
 impl DisallowedScriptIdents {
-    pub fn new(whitelist: &[String]) -> Self {
-        let whitelist = whitelist
-            .iter()
-            .map(String::as_str)
-            .filter_map(Script::from_full_name)
-            .collect();
-        Self { whitelist }
+    pub fn new(conf: &'static Conf) -> Self {
+        Self {
+            whitelist: conf
+                .allowed_scripts
+                .iter()
+                .map(String::as_str)
+                .filter_map(Script::from_full_name)
+                .collect(),
+        }
     }
 }
 
@@ -82,30 +84,25 @@ impl EarlyLintPass for DisallowedScriptIdents {
             // Note: `symbol.as_str()` is an expensive operation, thus should not be called
             // more than once for a single symbol.
             let symbol_str = symbol.as_str();
-            if symbol_str.is_ascii() {
-                continue;
-            }
 
-            for c in symbol_str.chars() {
-                // We want to iterate through all the scripts associated with this character
-                // and check whether at least of one scripts is in the whitelist.
-                let forbidden_script = c
-                    .script_extension()
-                    .iter()
-                    .find(|script| !self.whitelist.contains(script));
-                if let Some(script) = forbidden_script {
-                    span_lint(
-                        cx,
-                        DISALLOWED_SCRIPT_IDENTS,
-                        span,
-                        format!(
-                            "identifier `{symbol_str}` has a Unicode script that is not allowed by configuration: {}",
-                            script.full_name()
-                        ),
-                    );
-                    // We don't want to spawn warning multiple times over a single identifier.
-                    break;
-                }
+            // Check if any character in the symbol is not part of any allowed script.
+            // Fast path for ascii-only idents.
+            if !symbol_str.is_ascii()
+                && let Some(script) = symbol_str.chars().find_map(|c| {
+                    c.script_extension()
+                        .iter()
+                        .find(|script| !self.whitelist.contains(script))
+                })
+            {
+                span_lint(
+                    cx,
+                    DISALLOWED_SCRIPT_IDENTS,
+                    span,
+                    format!(
+                        "identifier `{symbol_str}` has a Unicode script that is not allowed by configuration: {}",
+                        script.full_name()
+                    ),
+                );
             }
         }
     }

@@ -3,12 +3,13 @@
 
 //@ ignore-cross-compile
 
-use run_make_support::{dynamic_lib, rustc};
 use std::fs::File;
+
+use run_make_support::{dynamic_lib_name, rustc};
 
 fn main() {
     rustc().input("foo.rs").arg("-Cprefer-dynamic").run();
-    File::create(dynamic_lib("foo-something-special")).unwrap();
-    File::create(dynamic_lib("foo-something-special2")).unwrap();
+    File::create(dynamic_lib_name("foo-something-special")).unwrap();
+    File::create(dynamic_lib_name("foo-something-special2")).unwrap();
     rustc().input("bar.rs").run();
 }

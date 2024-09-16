@@ -1,9 +1,8 @@
 //! A pass that annotates every item and method with its stability level,
 //! propagating default levels lexically from parent to children ast nodes.
 
-pub use self::StabilityLevel::*;
+use std::num::NonZero;
 
-use crate::ty::{self, TyCtxt};
 use rustc_ast::NodeId;
 use rustc_attr::{
     self as attr, ConstStability, DefaultBodyStability, DeprecatedSince, Deprecation, Stability,
@@ -22,8 +21,10 @@ use rustc_session::parse::feature_err_issue;
 use rustc_session::Session;
 use rustc_span::symbol::{sym, Symbol};
 use rustc_span::Span;
-use std::num::NonZero;
 use tracing::debug;
+
+pub use self::StabilityLevel::*;
+use crate::ty::{self, TyCtxt};
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum StabilityLevel {
@@ -112,7 +113,7 @@ pub fn report_unstable(
 ) {
     let msg = match reason {
         Some(r) => format!("use of unstable library feature '{feature}': {r}"),
-        None => format!("use of unstable library feature '{}'", &feature),
+        None => format!("use of unstable library feature '{feature}'"),
     };
 
     if is_soft {
@@ -176,7 +177,7 @@ impl<'a, G: EmissionGuarantee> rustc_errors::LintDiagnostic<'a, G> for Deprecate
             diag.arg("has_note", false);
         }
         if let Some(sub) = self.sub {
-            diag.subdiagnostic(diag.dcx, sub);
+            diag.subdiagnostic(sub);
         }
     }
 }
@@ -443,10 +444,11 @@ impl<'tcx> TyCtxt<'tcx> {
                 // the `-Z force-unstable-if-unmarked` flag present (we're
                 // compiling a compiler crate), then let this missing feature
                 // annotation slide.
-                if feature == sym::rustc_private && issue == NonZero::new(27812) {
-                    if self.sess.opts.unstable_opts.force_unstable_if_unmarked {
-                        return EvalResult::Allow;
-                    }
+                if feature == sym::rustc_private
+                    && issue == NonZero::new(27812)
+                    && self.sess.opts.unstable_opts.force_unstable_if_unmarked
+                {
+                    return EvalResult::Allow;
                 }
 
                 if matches!(allow_unstable, AllowUnstable::Yes) {

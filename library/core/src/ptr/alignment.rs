@@ -1,5 +1,4 @@
 use crate::num::NonZero;
-#[cfg(debug_assertions)]
 use crate::ub_checks::assert_unsafe_precondition;
 use crate::{cmp, fmt, hash, mem, num};
 
@@ -77,7 +76,6 @@ impl Alignment {
     #[rustc_const_unstable(feature = "ptr_alignment_type", issue = "102070")]
     #[inline]
     pub const unsafe fn new_unchecked(align: usize) -> Self {
-        #[cfg(debug_assertions)]
         assert_unsafe_precondition!(
             check_language_ub,
             "Alignment::new_unchecked requires a power of two",
@@ -201,7 +199,6 @@ impl From<Alignment> for usize {
     }
 }
 
-#[rustc_const_unstable(feature = "const_alloc_layout", issue = "67521")]
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
 impl cmp::Ord for Alignment {
     #[inline]
@@ -210,7 +207,6 @@ impl cmp::Ord for Alignment {
     }
 }
 
-#[rustc_const_unstable(feature = "const_alloc_layout", issue = "67521")]
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
 impl cmp::PartialOrd for Alignment {
     #[inline]

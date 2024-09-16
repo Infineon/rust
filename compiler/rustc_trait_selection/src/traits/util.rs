@@ -1,19 +1,20 @@
 use std::collections::BTreeMap;
 
-use super::NormalizeExt;
-use super::{ObligationCause, PredicateObligation, SelectionContext};
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::Diag;
 use rustc_hir::def_id::DefId;
 use rustc_infer::infer::{InferCtxt, InferOk};
+pub use rustc_infer::traits::util::*;
 use rustc_middle::bug;
-use rustc_middle::ty::GenericArgsRef;
-use rustc_middle::ty::{self, ImplSubject, Ty, TyCtxt, TypeVisitableExt, Upcast};
-use rustc_middle::ty::{TypeFoldable, TypeFolder, TypeSuperFoldable};
+use rustc_middle::ty::{
+    self, GenericArgsRef, ImplSubject, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable,
+    TypeVisitableExt, Upcast,
+};
 use rustc_span::Span;
 use smallvec::{smallvec, SmallVec};
+use tracing::debug;
 
-pub use rustc_infer::traits::util::*;
+use super::{NormalizeExt, ObligationCause, PredicateObligation, SelectionContext};
 
 ///////////////////////////////////////////////////////////////////////////
 // `TraitAliasExpander` iterator
@@ -128,11 +129,11 @@ impl<'tcx> TraitAliasExpander<'tcx> {
         }
 
         // Get components of trait alias.
-        let predicates = tcx.super_predicates_of(trait_ref.def_id());
+        let predicates = tcx.explicit_super_predicates_of(trait_ref.def_id());
         debug!(?predicates);
 
-        let items = predicates.predicates.iter().rev().filter_map(|(pred, span)| {
-            pred.instantiate_supertrait(tcx, &trait_ref)
+        let items = predicates.skip_binder().iter().rev().filter_map(|(pred, span)| {
+            pred.instantiate_supertrait(tcx, trait_ref)
                 .as_trait_clause()
                 .map(|trait_ref| item.clone_and_push(trait_ref.map_bound(|t| t.trait_ref), *span))
         });
@@ -168,7 +169,7 @@ impl<'tcx> Iterator for TraitAliasExpander<'tcx> {
 /// Instantiate all bound parameters of the impl subject with the given args,
 /// returning the resulting subject and all obligations that arise.
 /// The obligations are closed under normalization.
-pub fn impl_subject_and_oblig<'a, 'tcx>(
+pub(crate) fn impl_subject_and_oblig<'a, 'tcx>(
     selcx: &SelectionContext<'a, 'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     impl_def_id: DefId,
@@ -208,24 +209,7 @@ pub fn upcast_choices<'tcx>(
     supertraits(tcx, source_trait_ref).filter(|r| r.def_id() == target_trait_def_id).collect()
 }
 
-/// Given an upcast trait object described by `object`, returns the
-/// index of the method `method_def_id` (which should be part of
-/// `object.upcast_trait_ref`) within the vtable for `object`.
-pub fn get_vtable_index_of_object_method<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    vtable_base: usize,
-    method_def_id: DefId,
-) -> Option<usize> {
-    // Count number of methods preceding the one we are selecting and
-    // add them to the total offset.
-    tcx.own_existential_vtable_entries(tcx.parent(method_def_id))
-        .iter()
-        .copied()
-        .position(|def_id| def_id == method_def_id)
-        .map(|index| vtable_base + index)
-}
-
-pub fn closure_trait_ref_and_return_type<'tcx>(
+pub(crate) fn closure_trait_ref_and_return_type<'tcx>(
     tcx: TyCtxt<'tcx>,
     fn_trait_def_id: DefId,
     self_ty: Ty<'tcx>,
@@ -254,7 +238,7 @@ pub fn closure_trait_ref_and_return_type<'tcx>(
     sig.map_bound(|sig| (trait_ref, sig.output()))
 }
 
-pub fn coroutine_trait_ref_and_outputs<'tcx>(
+pub(crate) fn coroutine_trait_ref_and_outputs<'tcx>(
     tcx: TyCtxt<'tcx>,
     fn_trait_def_id: DefId,
     self_ty: Ty<'tcx>,
@@ -265,7 +249,7 @@ pub fn coroutine_trait_ref_and_outputs<'tcx>(
     (trait_ref, sig.yield_ty, sig.return_ty)
 }
 
-pub fn future_trait_ref_and_outputs<'tcx>(
+pub(crate) fn future_trait_ref_and_outputs<'tcx>(
     tcx: TyCtxt<'tcx>,
     fn_trait_def_id: DefId,
     self_ty: Ty<'tcx>,
@@ -276,7 +260,7 @@ pub fn future_trait_ref_and_outputs<'tcx>(
     (trait_ref, sig.return_ty)
 }
 
-pub fn iterator_trait_ref_and_outputs<'tcx>(
+pub(crate) fn iterator_trait_ref_and_outputs<'tcx>(
     tcx: TyCtxt<'tcx>,
     iterator_def_id: DefId,
     self_ty: Ty<'tcx>,
@@ -287,7 +271,7 @@ pub fn iterator_trait_ref_and_outputs<'tcx>(
     (trait_ref, sig.yield_ty)
 }
 
-pub fn async_iterator_trait_ref_and_outputs<'tcx>(
+pub(crate) fn async_iterator_trait_ref_and_outputs<'tcx>(
     tcx: TyCtxt<'tcx>,
     async_iterator_def_id: DefId,
     self_ty: Ty<'tcx>,
@@ -303,7 +287,7 @@ pub fn impl_item_is_final(tcx: TyCtxt<'_>, assoc_item: &ty::AssocItem) -> bool {
         && tcx.defaultness(assoc_item.container_id(tcx)).is_final()
 }
 
-pub enum TupleArgumentsFlag {
+pub(crate) enum TupleArgumentsFlag {
     Yes,
     No,
 }
@@ -348,8 +332,8 @@ pub fn with_replaced_escaping_bound_vars<
     }
 }
 
-pub struct BoundVarReplacer<'me, 'tcx> {
-    infcx: &'me InferCtxt<'tcx>,
+pub struct BoundVarReplacer<'a, 'tcx> {
+    infcx: &'a InferCtxt<'tcx>,
     // These three maps track the bound variable that were replaced by placeholders. It might be
     // nice to remove these since we already have the `kind` in the placeholder; we really just need
     // the `var` (but we *could* bring that into scope if we were to track them as we pass them).
@@ -361,15 +345,15 @@ pub struct BoundVarReplacer<'me, 'tcx> {
     current_index: ty::DebruijnIndex,
     // The `UniverseIndex` of the binding levels above us. These are optional, since we are lazy:
     // we don't actually create a universe until we see a bound var we have to replace.
-    universe_indices: &'me mut Vec<Option<ty::UniverseIndex>>,
+    universe_indices: &'a mut Vec<Option<ty::UniverseIndex>>,
 }
 
-impl<'me, 'tcx> BoundVarReplacer<'me, 'tcx> {
+impl<'a, 'tcx> BoundVarReplacer<'a, 'tcx> {
     /// Returns `Some` if we *were* able to replace bound vars. If there are any bound vars that
     /// use a binding level above `universe_indices.len()`, we fail.
     pub fn replace_bound_vars<T: TypeFoldable<TyCtxt<'tcx>>>(
-        infcx: &'me InferCtxt<'tcx>,
-        universe_indices: &'me mut Vec<Option<ty::UniverseIndex>>,
+        infcx: &'a InferCtxt<'tcx>,
+        universe_indices: &'a mut Vec<Option<ty::UniverseIndex>>,
         value: T,
     ) -> (
         T,
@@ -411,7 +395,7 @@ impl<'me, 'tcx> BoundVarReplacer<'me, 'tcx> {
 }
 
 impl<'tcx> TypeFolder<TyCtxt<'tcx>> for BoundVarReplacer<'_, 'tcx> {
-    fn interner(&self) -> TyCtxt<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
         self.infcx.tcx
     }
 
@@ -483,7 +467,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for BoundVarReplacer<'_, 'tcx> {
                 let universe = self.universe_for(debruijn);
                 let p = ty::PlaceholderConst { universe, bound: bound_const };
                 self.mapped_consts.insert(p, bound_const);
-                ty::Const::new_placeholder(self.infcx.tcx, p, ct.ty())
+                ty::Const::new_placeholder(self.infcx.tcx, p)
             }
             _ => ct.super_fold_with(self),
         }
@@ -495,22 +479,22 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for BoundVarReplacer<'_, 'tcx> {
 }
 
 /// The inverse of [`BoundVarReplacer`]: replaces placeholders with the bound vars from which they came.
-pub struct PlaceholderReplacer<'me, 'tcx> {
-    infcx: &'me InferCtxt<'tcx>,
+pub struct PlaceholderReplacer<'a, 'tcx> {
+    infcx: &'a InferCtxt<'tcx>,
     mapped_regions: FxIndexMap<ty::PlaceholderRegion, ty::BoundRegion>,
     mapped_types: FxIndexMap<ty::PlaceholderType, ty::BoundTy>,
     mapped_consts: BTreeMap<ty::PlaceholderConst, ty::BoundVar>,
-    universe_indices: &'me [Option<ty::UniverseIndex>],
+    universe_indices: &'a [Option<ty::UniverseIndex>],
     current_index: ty::DebruijnIndex,
 }
 
-impl<'me, 'tcx> PlaceholderReplacer<'me, 'tcx> {
+impl<'a, 'tcx> PlaceholderReplacer<'a, 'tcx> {
     pub fn replace_placeholders<T: TypeFoldable<TyCtxt<'tcx>>>(
-        infcx: &'me InferCtxt<'tcx>,
+        infcx: &'a InferCtxt<'tcx>,
         mapped_regions: FxIndexMap<ty::PlaceholderRegion, ty::BoundRegion>,
         mapped_types: FxIndexMap<ty::PlaceholderType, ty::BoundTy>,
         mapped_consts: BTreeMap<ty::PlaceholderConst, ty::BoundVar>,
-        universe_indices: &'me [Option<ty::UniverseIndex>],
+        universe_indices: &'a [Option<ty::UniverseIndex>],
         value: T,
     ) -> T {
         let mut replacer = PlaceholderReplacer {
@@ -526,7 +510,7 @@ impl<'me, 'tcx> PlaceholderReplacer<'me, 'tcx> {
 }
 
 impl<'tcx> TypeFolder<TyCtxt<'tcx>> for PlaceholderReplacer<'_, 'tcx> {
-    fn interner(&self) -> TyCtxt<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
         self.infcx.tcx
     }
 
@@ -567,7 +551,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for PlaceholderReplacer<'_, 'tcx> {
                         let db = ty::DebruijnIndex::from_usize(
                             self.universe_indices.len() - index + self.current_index.as_usize() - 1,
                         );
-                        ty::Region::new_bound(self.interner(), db, *replace_var)
+                        ty::Region::new_bound(self.cx(), db, *replace_var)
                     }
                     None => r1,
                 }
@@ -626,7 +610,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for PlaceholderReplacer<'_, 'tcx> {
                     let db = ty::DebruijnIndex::from_usize(
                         self.universe_indices.len() - index + self.current_index.as_usize() - 1,
                     );
-                    ty::Const::new_bound(self.infcx.tcx, db, *replace_var, ct.ty())
+                    ty::Const::new_bound(self.infcx.tcx, db, *replace_var)
                 }
                 None => {
                     if ct.has_infer() {

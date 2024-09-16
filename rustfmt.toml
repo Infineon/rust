@@ -2,6 +2,8 @@
 version = "Two"
 use_small_heuristics = "Max"
 merge_derives = false
+group_imports = "StdExternalCrate"
+imports_granularity = "Module"
 
 # Files to ignore. Each entry uses gitignore syntax, but `!` prefixes aren't allowed.
 ignore = [
@@ -29,7 +31,6 @@ ignore = [
     "library/backtrace",
     "library/portable-simd",
     "library/stdarch",
-    "compiler/rustc_codegen_gcc",
     "src/doc/book",
     "src/doc/edition-guide",
     "src/doc/embedded-book",
@@ -44,8 +45,13 @@ ignore = [
     "src/tools/rust-analyzer",
     "src/tools/rustc-perf",
     "src/tools/rustfmt",
+    "src/gcc",
 
     # These are ignored by a standard cargo fmt run.
     "compiler/rustc_codegen_cranelift/scripts",
     "compiler/rustc_codegen_cranelift/example/gen_block_iterate.rs", # uses edition 2024
+    "compiler/rustc_codegen_gcc/tests",
+    # Code automatically generated and included.
+    "compiler/rustc_codegen_gcc/src/intrinsic/archs.rs",
+    "compiler/rustc_codegen_gcc/example",
 ]

@@ -27,15 +27,14 @@ pub(crate) trait DocVisitor: Sized {
             | FunctionItem(_)
             | TestItem(_)
             | TypeAliasItem(_)
-            | OpaqueTyItem(_)
             | StaticItem(_)
-            | ConstantItem(_)
+            | ConstantItem(..)
             | TraitAliasItem(_)
             | TyMethodItem(_)
             | MethodItem(_, _)
             | StructFieldItem(_)
-            | ForeignFunctionItem(_)
-            | ForeignStaticItem(_)
+            | ForeignFunctionItem(..)
+            | ForeignStaticItem(..)
             | ForeignTypeItem
             | MacroItem(_)
             | ProcMacroItem(_)
@@ -50,8 +49,8 @@ pub(crate) trait DocVisitor: Sized {
 
     /// don't override!
     fn visit_item_recur(&mut self, item: &Item) {
-        match &*item.kind {
-            StrippedItem(i) => self.visit_inner_recur(i),
+        match &item.kind {
+            StrippedItem(i) => self.visit_inner_recur(&*i),
             _ => self.visit_inner_recur(&item.kind),
         }
     }

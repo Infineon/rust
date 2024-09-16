@@ -1,7 +1,7 @@
 use quote::quote;
 use syn::parse_quote;
 
-pub fn lift_derive(mut s: synstructure::Structure<'_>) -> proc_macro2::TokenStream {
+pub(super) fn lift_derive(mut s: synstructure::Structure<'_>) -> proc_macro2::TokenStream {
     s.add_bounds(synstructure::AddBounds::Generics);
     s.bind_with(|_| synstructure::BindStyle::Move);
     s.underscore_const(true);
@@ -45,7 +45,7 @@ pub fn lift_derive(mut s: synstructure::Structure<'_>) -> proc_macro2::TokenStre
         quote! {
             type Lifted = #lifted;
 
-            fn lift_to_tcx(self, __tcx: ::rustc_middle::ty::TyCtxt<'__lifted>) -> Option<#lifted> {
+            fn lift_to_interner(self, __tcx: ::rustc_middle::ty::TyCtxt<'__lifted>) -> Option<#lifted> {
                 Some(match self { #body })
             }
         },

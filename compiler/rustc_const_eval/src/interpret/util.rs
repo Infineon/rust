@@ -1,4 +1,5 @@
-use crate::const_eval::{CompileTimeEvalContext, CompileTimeInterpreter, InterpretationResult};
+use std::ops::ControlFlow;
+
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::mir;
 use rustc_middle::mir::interpret::{Allocation, InterpResult, Pointer};
@@ -6,10 +7,10 @@ use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{
     self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
 };
-use std::ops::ControlFlow;
 use tracing::debug;
 
-use super::{throw_inval, InterpCx, MPlaceTy, MemPlaceMeta, MemoryKind};
+use super::{throw_inval, InterpCx, MPlaceTy, MemoryKind};
+use crate::const_eval::{CompileTimeInterpCx, CompileTimeMachine, InterpretationResult};
 
 /// Checks whether a type contains generic parameters which must be instantiated.
 ///
@@ -44,7 +45,7 @@ where
                 | ty::CoroutineClosure(def_id, args, ..)
                 | ty::Coroutine(def_id, args, ..)
                 | ty::FnDef(def_id, args) => {
-                    let instance = ty::InstanceDef::Item(def_id);
+                    let instance = ty::InstanceKind::Item(def_id);
                     let unused_params = self.tcx.unused_generic_params(instance);
                     for (index, arg) in args.into_iter().enumerate() {
                         let index = index
@@ -84,7 +85,7 @@ where
 impl<'tcx> InterpretationResult<'tcx> for mir::interpret::ConstAllocation<'tcx> {
     fn make_result(
         mplace: MPlaceTy<'tcx>,
-        ecx: &mut InterpCx<'tcx, CompileTimeInterpreter<'tcx>>,
+        ecx: &mut InterpCx<'tcx, CompileTimeMachine<'tcx>>,
     ) -> Self {
         let alloc_id = mplace.ptr().provenance.unwrap().alloc_id();
         let alloc = ecx.memory.alloc_map.swap_remove(&alloc_id).unwrap().1;
@@ -93,7 +94,7 @@ impl<'tcx> InterpretationResult<'tcx> for mir::interpret::ConstAllocation<'tcx> 
 }
 
 pub(crate) fn create_static_alloc<'tcx>(
-    ecx: &mut CompileTimeEvalContext<'tcx>,
+    ecx: &mut CompileTimeInterpCx<'tcx>,
     static_def_id: LocalDefId,
     layout: TyAndLayout<'tcx>,
 ) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
@@ -102,5 +103,5 @@ pub(crate) fn create_static_alloc<'tcx>(
     assert_eq!(ecx.machine.static_root_ids, None);
     ecx.machine.static_root_ids = Some((alloc_id, static_def_id));
     assert!(ecx.memory.alloc_map.insert(alloc_id, (MemoryKind::Stack, alloc)).is_none());
-    Ok(ecx.ptr_with_meta_to_mplace(Pointer::from(alloc_id).into(), MemPlaceMeta::None, layout))
+    Ok(ecx.ptr_to_mplace(Pointer::from(alloc_id).into(), layout))
 }

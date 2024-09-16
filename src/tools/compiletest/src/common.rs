@@ -1,18 +1,17 @@
-pub use self::Mode::*;
-
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::fmt;
-use std::iter;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::OnceLock;
+use std::{fmt, iter};
 
-use crate::util::{add_dylib_path, PathBufExt};
 use build_helper::git::GitConfig;
 use serde::de::{Deserialize, Deserializer, Error as _};
-use std::collections::{HashMap, HashSet};
 use test::{ColorConfig, OutputFormat};
+
+pub use self::Mode::*;
+use crate::util::{add_dylib_path, PathBufExt};
 
 macro_rules! string_enum {
     ($(#[$meta:meta])* $vis:vis enum $name:ident { $($variant:ident => $repr:expr,)* }) => {
@@ -275,6 +274,9 @@ pub struct Config {
     /// Flags to pass to the compiler when building for the target
     pub target_rustcflags: Vec<String>,
 
+    /// Whether the compiler and stdlib has been built with randomized struct layouts
+    pub rust_randomized_layout: bool,
+
     /// Whether tests should be optimized by default. Individual test-suites and test files may
     /// override this setting.
     pub optimize_tests: bool,
@@ -297,14 +299,8 @@ pub struct Config {
     /// Version of GDB, encoded as ((major * 1000) + minor) * 1000 + patch
     pub gdb_version: Option<u32>,
 
-    /// Whether GDB has native rust support
-    pub gdb_native_rust: bool,
-
     /// Version of LLDB
     pub lldb_version: Option<u32>,
-
-    /// Whether LLDB has native rust support
-    pub lldb_native_rust: bool,
 
     /// Version of LLVM
     pub llvm_version: Option<u32>,
@@ -388,6 +384,7 @@ pub struct Config {
     // Needed both to construct build_helper::git::GitConfig
     pub git_repository: String,
     pub nightly_branch: String,
+    pub git_merge_commit_email: String,
 
     /// True if the profiler runtime is enabled for this target.
     /// Used by the "needs-profiler-support" header in test files.
@@ -465,7 +462,11 @@ impl Config {
     }
 
     pub fn git_config(&self) -> GitConfig<'_> {
-        GitConfig { git_repository: &self.git_repository, nightly_branch: &self.nightly_branch }
+        GitConfig {
+            git_repository: &self.git_repository,
+            nightly_branch: &self.nightly_branch,
+            git_merge_commit_email: &self.git_merge_commit_email,
+        }
     }
 }
 
@@ -582,7 +583,7 @@ impl TargetCfgs {
                         name,
                         Some(
                             value
-                                .strip_suffix("\"")
+                                .strip_suffix('\"')
                                 .expect("key-value pair should be properly quoted"),
                         ),
                     )
@@ -760,8 +761,14 @@ pub fn output_testname_unique(
 /// test/revision should reside. Example:
 ///   /path/to/build/host-triple/test/ui/relative/testname.revision.mode/
 pub fn output_base_dir(config: &Config, testpaths: &TestPaths, revision: Option<&str>) -> PathBuf {
-    output_relative_path(config, &testpaths.relative_dir)
-        .join(output_testname_unique(config, testpaths, revision))
+    // In run-make tests, constructing a relative path + unique testname causes a double layering
+    // since revisions are not supported, causing unnecessary nesting.
+    if config.mode == Mode::RunMake {
+        output_relative_path(config, &testpaths.relative_dir)
+    } else {
+        output_relative_path(config, &testpaths.relative_dir)
+            .join(output_testname_unique(config, testpaths, revision))
+    }
 }
 
 /// Absolute path to the base filename used as output for the given

@@ -2,13 +2,14 @@
 
 use std::cell::RefCell;
 
-use crate::diagnostics::diagnostic_builder::DiagnosticDeriveKind;
-use crate::diagnostics::error::{span_err, DiagnosticDeriveError};
-use crate::diagnostics::utils::SetOnce;
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::spanned::Spanned;
 use synstructure::Structure;
+
+use crate::diagnostics::diagnostic_builder::DiagnosticDeriveKind;
+use crate::diagnostics::error::{span_err, DiagnosticDeriveError};
+use crate::diagnostics::utils::SetOnce;
 
 /// The central struct for constructing the `into_diag` method from an annotated struct.
 pub(crate) struct DiagnosticDerive<'a> {
@@ -71,6 +72,8 @@ impl<'a> DiagnosticDerive<'a> {
         });
 
         // A lifetime of `'a` causes conflicts, but `_sess` is fine.
+        // FIXME(edition_2024): Fix the `keyword_idents_2024` lint to not trigger here?
+        #[allow(keyword_idents_2024)]
         let mut imp = structure.gen_impl(quote! {
             gen impl<'_sess, G> rustc_errors::Diagnostic<'_sess, G> for @Self
                 where G: rustc_errors::EmissionGuarantee
@@ -78,7 +81,7 @@ impl<'a> DiagnosticDerive<'a> {
                 #[track_caller]
                 fn into_diag(
                     self,
-                    dcx: &'_sess rustc_errors::DiagCtxt,
+                    dcx: rustc_errors::DiagCtxtHandle<'_sess>,
                     level: rustc_errors::Level
                 ) -> rustc_errors::Diag<'_sess, G> {
                     #implementation
@@ -148,6 +151,8 @@ impl<'a> LintDiagnosticDerive<'a> {
             }
         });
 
+        // FIXME(edition_2024): Fix the `keyword_idents_2024` lint to not trigger here?
+        #[allow(keyword_idents_2024)]
         let mut imp = structure.gen_impl(quote! {
             gen impl<'__a> rustc_errors::LintDiagnostic<'__a, ()> for @Self {
                 #[track_caller]

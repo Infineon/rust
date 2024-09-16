@@ -7,7 +7,8 @@ use std::process::Command;
 use glob::glob;
 
 use crate::common::{UI_COVERAGE, UI_COVERAGE_MAP};
-use crate::runtest::{static_regex, Emit, ProcRes, TestCx, WillExecute};
+use crate::runtest::{Emit, ProcRes, TestCx, WillExecute};
+use crate::util::static_regex;
 
 impl<'test> TestCx<'test> {
     fn coverage_dump_path(&self) -> &Path {
@@ -190,7 +191,7 @@ impl<'test> TestCx<'test> {
 
         rustdoc_cmd.arg(&self.testpaths.file);
 
-        let proc_res = self.compose_and_run_compiler(rustdoc_cmd, None);
+        let proc_res = self.compose_and_run_compiler(rustdoc_cmd, None, self.testpaths);
         if !proc_res.status.success() {
             self.fatal_proc_rec("rustdoc --test failed!", &proc_res)
         }

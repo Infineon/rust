@@ -1,25 +1,26 @@
 use rustc_ast::{ast, attr, MetaItemKind, NestedMetaItem};
 use rustc_attr::{list_contains_name, InlineAttr, InstructionSetAttr, OptimizeAttr};
-use rustc_errors::{codes::*, struct_span_code_err};
+use rustc_errors::codes::*;
+use rustc_errors::{struct_span_code_err, DiagMessage, SubdiagMessage};
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId, LOCAL_CRATE};
-use rustc_hir::{lang_items, weak_lang_items::WEAK_LANG_ITEMS, LangItem};
-use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrFlags, CodegenFnAttrs};
+use rustc_hir::weak_lang_items::WEAK_LANG_ITEMS;
+use rustc_hir::{lang_items, LangItem};
+use rustc_middle::middle::codegen_fn_attrs::{
+    CodegenFnAttrFlags, CodegenFnAttrs, PatchableFunctionEntry,
+};
 use rustc_middle::mir::mono::Linkage;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{self as ty, TyCtxt};
-use rustc_session::{lint, parse::feature_err};
+use rustc_session::lint;
+use rustc_session::parse::feature_err;
 use rustc_span::symbol::Ident;
 use rustc_span::{sym, Span};
 use rustc_target::spec::{abi, SanitizerSet};
 
 use crate::errors;
-use crate::target_features::from_target_feature;
-use crate::{
-    errors::{ExpectedCoverageSymbol, ExpectedUsedSymbol},
-    target_features::check_target_feature_trait_unsafe,
-};
+use crate::target_features::{check_target_feature_trait_unsafe, from_target_feature};
 
 fn linkage_by_name(tcx: TyCtxt<'_>, def_id: LocalDefId, name: &str) -> Linkage {
     use rustc_middle::mir::mono::Linkage::*;
@@ -128,21 +129,6 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, did: LocalDefId) -> CodegenFnAttrs {
                         .emit();
                 }
             }
-            sym::coverage => {
-                let inner = attr.meta_item_list();
-                match inner.as_deref() {
-                    Some([item]) if item.has_name(sym::off) => {
-                        codegen_fn_attrs.flags |= CodegenFnAttrFlags::NO_COVERAGE;
-                    }
-                    Some([item]) if item.has_name(sym::on) => {
-                        // Allow #[coverage(on)] for being explicit, maybe also in future to enable
-                        // coverage on a smaller scope within an excluded larger scope.
-                    }
-                    Some(_) | None => {
-                        tcx.dcx().emit_err(ExpectedCoverageSymbol { span: attr.span });
-                    }
-                }
-            }
             sym::rustc_std_internal_symbol => {
                 codegen_fn_attrs.flags |= CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL
             }
@@ -174,7 +160,7 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, did: LocalDefId) -> CodegenFnAttrs {
                         codegen_fn_attrs.flags |= CodegenFnAttrFlags::USED;
                     }
                     Some(_) => {
-                        tcx.dcx().emit_err(ExpectedUsedSymbol { span: attr.span });
+                        tcx.dcx().emit_err(errors::ExpectedUsedSymbol { span: attr.span });
                     }
                     None => {
                         // Unfortunately, unconditionally using `llvm.used` causes
@@ -345,7 +331,7 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, did: LocalDefId) -> CodegenFnAttrs {
             sym::link_section => {
                 if let Some(val) = attr.value_str() {
                     if val.as_str().bytes().any(|b| b == 0) {
-                        let msg = format!("illegal null byte in link_section value: `{}`", &val);
+                        let msg = format!("illegal null byte in link_section value: `{val}`");
                         tcx.dcx().span_err(attr.span, msg);
                     } else {
                         codegen_fn_attrs.link_section = Some(val);
@@ -466,6 +452,80 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, did: LocalDefId) -> CodegenFnAttrs {
                     None
                 };
             }
+            sym::patchable_function_entry => {
+                codegen_fn_attrs.patchable_function_entry = attr.meta_item_list().and_then(|l| {
+                    let mut prefix = None;
+                    let mut entry = None;
+                    for item in l {
+                        let Some(meta_item) = item.meta_item() else {
+                            tcx.dcx().span_err(item.span(), "expected name value pair");
+                            continue;
+                        };
+
+                        let Some(name_value_lit) = meta_item.name_value_literal() else {
+                            tcx.dcx().span_err(item.span(), "expected name value pair");
+                            continue;
+                        };
+
+                        fn emit_error_with_label(
+                            tcx: TyCtxt<'_>,
+                            span: Span,
+                            error: impl Into<DiagMessage>,
+                            label: impl Into<SubdiagMessage>,
+                        ) {
+                            let mut err: rustc_errors::Diag<'_, _> =
+                                tcx.dcx().struct_span_err(span, error);
+                            err.span_label(span, label);
+                            err.emit();
+                        }
+
+                        let attrib_to_write = match meta_item.name_or_empty() {
+                            sym::prefix_nops => &mut prefix,
+                            sym::entry_nops => &mut entry,
+                            _ => {
+                                emit_error_with_label(
+                                    tcx,
+                                    item.span(),
+                                    "unexpected parameter name",
+                                    format!("expected {} or {}", sym::prefix_nops, sym::entry_nops),
+                                );
+                                continue;
+                            }
+                        };
+
+                        let rustc_ast::LitKind::Int(val, _) = name_value_lit.kind else {
+                            emit_error_with_label(
+                                tcx,
+                                name_value_lit.span,
+                                "invalid literal value",
+                                "value must be an integer between `0` and `255`",
+                            );
+                            continue;
+                        };
+
+                        let Ok(val) = val.get().try_into() else {
+                            emit_error_with_label(
+                                tcx,
+                                name_value_lit.span,
+                                "integer value out of range",
+                                "value must be between `0` and `255`",
+                            );
+                            continue;
+                        };
+
+                        *attrib_to_write = Some(val);
+                    }
+
+                    if let (None, None) = (prefix, entry) {
+                        tcx.dcx().span_err(attr.span, "must specify at least one parameter");
+                    }
+
+                    Some(PatchableFunctionEntry::from_prefix_and_entry(
+                        prefix.unwrap_or(0),
+                        entry.unwrap_or(0),
+                    ))
+                })
+            }
             _ => {}
         }
     }
@@ -557,37 +617,33 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, did: LocalDefId) -> CodegenFnAttrs {
     // purpose functions as they wouldn't have the right target features
     // enabled. For that reason we also forbid #[inline(always)] as it can't be
     // respected.
-    if !codegen_fn_attrs.target_features.is_empty() {
-        if codegen_fn_attrs.inline == InlineAttr::Always {
-            if let Some(span) = inline_span {
-                tcx.dcx().span_err(
-                    span,
-                    "cannot use `#[inline(always)]` with \
+    if !codegen_fn_attrs.target_features.is_empty() && codegen_fn_attrs.inline == InlineAttr::Always
+    {
+        if let Some(span) = inline_span {
+            tcx.dcx().span_err(
+                span,
+                "cannot use `#[inline(always)]` with \
                      `#[target_feature]`",
-                );
-            }
+            );
         }
     }
 
-    if !codegen_fn_attrs.no_sanitize.is_empty() {
-        if codegen_fn_attrs.inline == InlineAttr::Always {
-            if let (Some(no_sanitize_span), Some(inline_span)) = (no_sanitize_span, inline_span) {
-                let hir_id = tcx.local_def_id_to_hir_id(did);
-                tcx.node_span_lint(
-                    lint::builtin::INLINE_NO_SANITIZE,
-                    hir_id,
-                    no_sanitize_span,
-                    |lint| {
-                        lint.primary_message("`no_sanitize` will have no effect after inlining");
-                        lint.span_note(inline_span, "inlining requested here");
-                    },
-                )
-            }
+    if !codegen_fn_attrs.no_sanitize.is_empty() && codegen_fn_attrs.inline == InlineAttr::Always {
+        if let (Some(no_sanitize_span), Some(inline_span)) = (no_sanitize_span, inline_span) {
+            let hir_id = tcx.local_def_id_to_hir_id(did);
+            tcx.node_span_lint(
+                lint::builtin::INLINE_NO_SANITIZE,
+                hir_id,
+                no_sanitize_span,
+                |lint| {
+                    lint.primary_message("`no_sanitize` will have no effect after inlining");
+                    lint.span_note(inline_span, "inlining requested here");
+                },
+            )
         }
     }
 
     if codegen_fn_attrs.flags.contains(CodegenFnAttrFlags::NAKED) {
-        codegen_fn_attrs.flags |= CodegenFnAttrFlags::NO_COVERAGE;
         codegen_fn_attrs.inline = InlineAttr::Never;
     }
 
@@ -670,7 +726,7 @@ fn check_link_ordinal(tcx: TyCtxt<'_>, attr: &ast::Attribute) -> Option<u16> {
         if *ordinal <= u16::MAX as u128 {
             Some(ordinal.get() as u16)
         } else {
-            let msg = format!("ordinal value in `link_ordinal` is too large: `{}`", &ordinal);
+            let msg = format!("ordinal value in `link_ordinal` is too large: `{ordinal}`");
             tcx.dcx()
                 .struct_span_err(attr.span, msg)
                 .with_note("the value may not exceed `u16::MAX`")

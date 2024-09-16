@@ -13,12 +13,11 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 use core::cmp::Ordering;
-use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::iter::FusedIterator;
 use core::marker::PhantomData;
-use core::mem;
 use core::ptr::NonNull;
+use core::{fmt, mem};
 
 use super::SpecExtend;
 use crate::alloc::{Allocator, Global};
@@ -1495,6 +1494,14 @@ impl<'a, T, A: Allocator> Cursor<'a, T, A> {
     pub fn back(&self) -> Option<&'a T> {
         self.list.back()
     }
+
+    /// Provides a reference to the cursor's parent list.
+    #[must_use]
+    #[inline(always)]
+    #[unstable(feature = "linked_list_cursors", issue = "58533")]
+    pub fn as_list(&self) -> &'a LinkedList<T, A> {
+        self.list
+    }
 }
 
 impl<'a, T, A: Allocator> CursorMut<'a, T, A> {
@@ -1604,6 +1611,18 @@ impl<'a, T, A: Allocator> CursorMut<'a, T, A> {
     #[unstable(feature = "linked_list_cursors", issue = "58533")]
     pub fn as_cursor(&self) -> Cursor<'_, T, A> {
         Cursor { list: self.list, current: self.current, index: self.index }
+    }
+
+    /// Provides a read-only reference to the cursor's parent list.
+    ///
+    /// The lifetime of the returned reference is bound to that of the
+    /// `CursorMut`, which means it cannot outlive the `CursorMut` and that the
+    /// `CursorMut` is frozen for the lifetime of the reference.
+    #[must_use]
+    #[inline(always)]
+    #[unstable(feature = "linked_list_cursors", issue = "58533")]
+    pub fn as_list(&self) -> &LinkedList<T, A> {
+        self.list
     }
 }
 

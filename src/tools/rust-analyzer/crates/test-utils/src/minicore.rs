@@ -55,6 +55,7 @@
 //!     size_of: sized
 //!     sized:
 //!     slice:
+//!     str:
 //!     sync: sized
 //!     transmute:
 //!     try: infallible
@@ -62,6 +63,7 @@
 //!     unsize: sized
 //!     todo: panic
 //!     unimplemented: panic
+//!     column:
 
 #![rustc_coherence_is_core]
 
@@ -123,7 +125,7 @@ pub mod marker {
         impl_copy! {
             usize u8 u16 u32 u64 u128
             isize i8 i16 i32 i64 i128
-            f32 f64
+            f16 f32 f64 f128
             bool char
         }
 
@@ -180,7 +182,7 @@ pub mod default {
         0; usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128
     }
     impl_default! {
-        0.0; f32 f64
+        0.0; f16 f32 f64 f128
     }
     // endregion:builtin_impls
 }
@@ -276,7 +278,7 @@ pub mod clone {
     impl_clone! {
         usize u8 u16 u32 u64 u128
         isize i8 i16 i32 i64 i128
-        f32 f64
+        f16 f32 f64 f128
         bool char
     }
 
@@ -796,7 +798,7 @@ pub mod ops {
         )*)
     }
 
-    add_impl! { usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 f32 f64 }
+    add_impl! { usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 f16 f32 f64 f128 }
     // endregion:builtin_impls
     // endregion:add
 
@@ -1043,7 +1045,7 @@ pub mod fmt {
     impl_debug! {
         usize u8 u16 u32 u64 u128
         isize i8 i16 i32 i64 i128
-        f32 f64
+        f16 f32 f64 f128
         bool char
     }
 
@@ -1194,6 +1196,7 @@ pub mod future {
     #[doc(notable_trait)]
     #[lang = "future_trait"]
     pub trait Future {
+        #[lang = "future_output"]
         type Output;
         #[lang = "poll"]
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>;
@@ -1291,6 +1294,7 @@ pub mod iter {
     mod traits {
         mod iterator {
             #[doc(notable_trait)]
+            #[lang = "iterator"]
             pub trait Iterator {
                 type Item;
                 #[lang = "next"]
@@ -1367,6 +1371,14 @@ pub mod iter {
     pub use self::traits::{IntoIterator, Iterator};
 }
 // endregion:iterator
+
+// region:str
+pub mod str {
+    pub const unsafe fn from_utf8_unchecked(v: &[u8]) -> &str {
+        ""
+    }
+}
+// endregion:str
 
 // region:panic
 mod panic {
@@ -1605,6 +1617,14 @@ pub mod error {
     }
 }
 // endregion:error
+
+// region:column
+#[rustc_builtin_macro]
+#[macro_export]
+macro_rules! column {
+    () => {};
+}
+// endregion:column
 
 pub mod prelude {
     pub mod v1 {

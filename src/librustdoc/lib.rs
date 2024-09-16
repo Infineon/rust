@@ -22,8 +22,6 @@
 #![allow(rustc::untranslatable_diagnostic)]
 
 extern crate thin_vec;
-#[macro_use]
-extern crate tracing;
 
 // N.B. these need `extern crate` even in 2018 edition
 // because they're loaded implicitly from the sysroot.
@@ -75,13 +73,15 @@ extern crate jemalloc_sys;
 use std::env::{self, VarError};
 use std::io::{self, IsTerminal};
 use std::process;
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
-use rustc_errors::{ErrorGuaranteed, FatalError};
+use rustc_errors::{DiagCtxtHandle, ErrorGuaranteed, FatalError};
 use rustc_interface::interface;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{make_crate_type_option, ErrorOutputType, RustcOptGroup};
 use rustc_session::{getopts, EarlyDiagCtxt};
+use tracing::info;
 
 use crate::clean::utils::DOC_RUST_LANG_ORG_CHANNEL;
 
@@ -555,6 +555,14 @@ fn opts() -> Vec<RustcOptGroup> {
         unstable("no-run", |o| {
             o.optflagmulti("", "no-run", "Compile doctests without running them")
         }),
+        unstable("remap-path-prefix", |o| {
+            o.optmulti(
+                "",
+                "remap-path-prefix",
+                "Remap source names in compiler messages",
+                "FROM=TO",
+            )
+        }),
         unstable("show-type-layout", |o| {
             o.optflagmulti("", "show-type-layout", "Include the memory layout of types in the docs")
         }),
@@ -596,6 +604,33 @@ fn opts() -> Vec<RustcOptGroup> {
                 "with-examples",
                 "",
                 "path to function call information (for displaying examples in the documentation)",
+            )
+        }),
+        unstable("merge", |o| {
+            o.optopt(
+                "",
+                "merge",
+                "Controls how rustdoc handles files from previously documented crates in the doc root
+                      none = Do not write cross-crate information to the --out-dir
+                      shared = Append current crate's info to files found in the --out-dir
+                      finalize = Write current crate's info and --include-parts-dir info to the --out-dir, overwriting conflicting files",
+                "none|shared|finalize",
+            )
+        }),
+        unstable("parts-out-dir", |o| {
+            o.optopt(
+                "",
+                "parts-out-dir",
+                "Writes trait implementations and other info for the current crate to provided path. Only use with --merge=none",
+                "path/to/doc.parts/<crate-name>",
+            )
+        }),
+        unstable("include-parts-dir", |o| {
+            o.optmulti(
+                "",
+                "include-parts-dir",
+                "Includes trait implementations and other crate info from provided path. Only use with --merge=finalize",
+                "path/to/doc.parts/<crate-name>",
             )
         }),
         // deprecated / removed options
@@ -665,7 +700,7 @@ fn usage(argv0: &str) {
 /// A result type used by several functions under `main()`.
 type MainResult = Result<(), ErrorGuaranteed>;
 
-pub(crate) fn wrap_return(dcx: &rustc_errors::DiagCtxt, res: Result<(), String>) -> MainResult {
+pub(crate) fn wrap_return(dcx: DiagCtxtHandle<'_>, res: Result<(), String>) -> MainResult {
     match res {
         Ok(()) => dcx.has_errors().map_or(Ok(()), Err),
         Err(err) => Err(dcx.err(err)),
@@ -690,6 +725,32 @@ fn run_renderer<'tcx, T: formats::FormatRenderer<'tcx>>(
             Err(msg.emit())
         }
     }
+}
+
+/// Renders and writes cross-crate info files, like the search index. This function exists so that
+/// we can run rustdoc without a crate root in the `--merge=finalize` mode. Cross-crate info files
+/// discovered via `--include-parts-dir` are combined and written to the doc root.
+fn run_merge_finalize(opt: config::RenderOptions) -> Result<(), error::Error> {
+    assert!(
+        opt.should_merge.write_rendered_cci,
+        "config.rs only allows us to return InputMode::NoInputMergeFinalize if --merge=finalize"
+    );
+    assert!(
+        !opt.should_merge.read_rendered_cci,
+        "config.rs only allows us to return InputMode::NoInputMergeFinalize if --merge=finalize"
+    );
+    let crates = html::render::CrateInfo::read_many(&opt.include_parts_dir)?;
+    let include_sources = !opt.html_no_source;
+    html::render::write_not_crate_specific(
+        &crates,
+        &opt.output,
+        &opt,
+        &opt.themes,
+        opt.extension_css.as_deref(),
+        &opt.resource_suffix,
+        include_sources,
+    )?;
+    Ok(())
 }
 
 fn main_args(
@@ -722,29 +783,43 @@ fn main_args(
 
     // Note that we discard any distinction between different non-zero exit
     // codes from `from_matches` here.
-    let (options, render_options) = match config::Options::from_matches(early_dcx, &matches, args) {
-        Some(opts) => opts,
-        None => return Ok(()),
+    let (input, options, render_options) =
+        match config::Options::from_matches(early_dcx, &matches, args) {
+            Some(opts) => opts,
+            None => return Ok(()),
+        };
+
+    let dcx =
+        core::new_dcx(options.error_format, None, options.diagnostic_width, &options.unstable_opts);
+    let dcx = dcx.handle();
+
+    let input = match input {
+        config::InputMode::HasFile(input) => input,
+        config::InputMode::NoInputMergeFinalize => {
+            return wrap_return(
+                dcx,
+                run_merge_finalize(render_options)
+                    .map_err(|e| format!("could not write merged cross-crate info: {e}")),
+            );
+        }
     };
 
-    let diag =
-        core::new_dcx(options.error_format, None, options.diagnostic_width, &options.unstable_opts);
-
-    match (options.should_test, options.markdown_input()) {
-        (true, Some(_)) => return wrap_return(&diag, markdown::test(options)),
-        (true, None) => return doctest::run(&diag, options),
-        (false, Some(input)) => {
-            let input = input.to_owned();
+    match (options.should_test, config::markdown_input(&input)) {
+        (true, Some(_)) => return wrap_return(dcx, doctest::test_markdown(&input, options)),
+        (true, None) => return doctest::run(dcx, input, options),
+        (false, Some(md_input)) => {
+            let md_input = md_input.to_owned();
             let edition = options.edition;
-            let config = core::create_config(options, &render_options, using_internal_features);
+            let config =
+                core::create_config(input, options, &render_options, using_internal_features);
 
             // `markdown::render` can invoke `doctest::make_test`, which
             // requires session globals and a thread pool, so we use
             // `run_compiler`.
             return wrap_return(
-                &diag,
+                dcx,
                 interface::run_compiler(config, |_compiler| {
-                    markdown::render(&input, render_options, edition)
+                    markdown::render(&md_input, render_options, edition)
                 }),
             );
         }
@@ -769,7 +844,7 @@ fn main_args(
     let scrape_examples_options = options.scrape_examples_options.clone();
     let bin_crate = options.bin_crate;
 
-    let config = core::create_config(options, &render_options, using_internal_features);
+    let config = core::create_config(input, options, &render_options, using_internal_features);
 
     interface::run_compiler(config, |compiler| {
         let sess = &compiler.sess;

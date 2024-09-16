@@ -1,6 +1,8 @@
 use std::ops::Range;
 
-use pulldown_cmark::{BrokenLink, CowStr, Event, LinkType, OffsetIter, Parser, Tag};
+use pulldown_cmark::{
+    BrokenLink, BrokenLinkCallback, CowStr, Event, LinkType, OffsetIter, Parser, Tag,
+};
 use rustc_ast::NodeId;
 use rustc_errors::SuggestionStyle;
 use rustc_hir::def::{DefKind, DocLinkResMap, Namespace, Res};
@@ -10,8 +12,7 @@ use rustc_resolve::rustdoc::{prepare_to_doc_link_resolution, source_span_for_mar
 use rustc_span::def_id::DefId;
 use rustc_span::Symbol;
 
-use crate::clean::utils::find_nearest_parent_module;
-use crate::clean::utils::inherits_doc_hidden;
+use crate::clean::utils::{find_nearest_parent_module, inherits_doc_hidden};
 use crate::clean::Item;
 use crate::core::DocContext;
 use crate::html::markdown::main_body_opts;
@@ -23,12 +24,7 @@ struct LinkData {
     display_link: String,
 }
 
-pub(crate) fn visit_item(cx: &DocContext<'_>, item: &Item) {
-    let Some(hir_id) = DocContext::as_local_hir_id(cx.tcx, item.item_id) else {
-        // If non-local, no need to check anything.
-        return;
-    };
-
+pub(crate) fn visit_item(cx: &DocContext<'_>, item: &Item, hir_id: HirId) {
     let hunks = prepare_to_doc_link_resolution(&item.attrs.doc_strings);
     for (item_id, doc) in hunks {
         if let Some(item_id) = item_id.or(item.def_id())
@@ -95,7 +91,7 @@ fn check_redundant_explicit_link<'md>(
 
     while let Some((event, link_range)) = offset_iter.next() {
         match event {
-            Event::Start(Tag::Link(link_type, dest, _)) => {
+            Event::Start(Tag::Link { link_type, dest_url, .. }) => {
                 let link_data = collect_link_data(&mut offset_iter);
 
                 if let Some(resolvable_link) = link_data.resolvable_link.as_ref() {
@@ -108,7 +104,7 @@ fn check_redundant_explicit_link<'md>(
                     }
                 }
 
-                let explicit_link = dest.to_string();
+                let explicit_link = dest_url.to_string();
                 let display_link = link_data.resolvable_link.clone()?;
 
                 if explicit_link.ends_with(&display_link) || display_link.ends_with(&explicit_link)
@@ -122,7 +118,7 @@ fn check_redundant_explicit_link<'md>(
                                 doc,
                                 resolutions,
                                 link_range,
-                                dest.to_string(),
+                                dest_url.to_string(),
                                 link_data,
                                 if link_type == LinkType::Inline {
                                     (b'(', b')')
@@ -139,7 +135,7 @@ fn check_redundant_explicit_link<'md>(
                                 doc,
                                 resolutions,
                                 link_range,
-                                &dest,
+                                &dest_url,
                                 link_data,
                             );
                         }
@@ -259,7 +255,9 @@ fn find_resolution(resolutions: &DocLinkResMap, path: &str) -> Option<Res<NodeId
 }
 
 /// Collects all necessary data of link.
-fn collect_link_data(offset_iter: &mut OffsetIter<'_, '_>) -> LinkData {
+fn collect_link_data<'input, F: BrokenLinkCallback<'input>>(
+    offset_iter: &mut OffsetIter<'input, F>,
+) -> LinkData {
     let mut resolvable_link = None;
     let mut resolvable_link_range = None;
     let mut display_link = String::new();

@@ -1,7 +1,7 @@
-use crate::base::ast::NestedMetaItem;
-use crate::errors;
-use crate::expand::{self, AstFragment, Invocation};
-use crate::module::DirOwnership;
+use std::default::Default;
+use std::iter;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use rustc_ast::attr::MarkedAttrs;
 use rustc_ast::ptr::P;
@@ -12,12 +12,14 @@ use rustc_ast::{self as ast, AttrVec, Attribute, HasAttrs, Item, NodeId, PatKind
 use rustc_attr::{self as attr, Deprecation, Stability};
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::sync::{self, Lrc};
-use rustc_errors::{DiagCtxt, ErrorGuaranteed, PResult};
+use rustc_errors::{DiagCtxtHandle, ErrorGuaranteed, PResult};
 use rustc_feature::Features;
 use rustc_lint_defs::{BufferedEarlyLint, RegisteredTools};
-use rustc_parse::{parser::Parser, MACRO_ARGUMENTS};
+use rustc_parse::parser::Parser;
+use rustc_parse::MACRO_ARGUMENTS;
 use rustc_session::config::CollapseMacroDebuginfo;
-use rustc_session::{parse::ParseSess, Limit, Session};
+use rustc_session::parse::ParseSess;
+use rustc_session::{Limit, Session};
 use rustc_span::def_id::{CrateNum, DefId, LocalDefId};
 use rustc_span::edition::Edition;
 use rustc_span::hygiene::{AstPass, ExpnData, ExpnKind, LocalExpnId, MacroKind};
@@ -25,11 +27,12 @@ use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::{FileName, Span, DUMMY_SP};
 use smallvec::{smallvec, SmallVec};
-use std::default::Default;
-use std::iter;
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use thin_vec::ThinVec;
+
+use crate::base::ast::NestedMetaItem;
+use crate::errors;
+use crate::expand::{self, AstFragment, Invocation};
+use crate::module::DirOwnership;
 
 // When adding new variants, make sure to
 // adjust the `visit_*` / `flat_map_*` calls in `InvocationCollector`
@@ -37,8 +40,7 @@ use thin_vec::ThinVec;
 #[derive(Debug, Clone)]
 pub enum Annotatable {
     Item(P<ast::Item>),
-    TraitItem(P<ast::AssocItem>),
-    ImplItem(P<ast::AssocItem>),
+    AssocItem(P<ast::AssocItem>, AssocCtxt),
     ForeignItem(P<ast::ForeignItem>),
     Stmt(P<ast::Stmt>),
     Expr(P<ast::Expr>),
@@ -56,8 +58,7 @@ impl Annotatable {
     pub fn span(&self) -> Span {
         match self {
             Annotatable::Item(item) => item.span,
-            Annotatable::TraitItem(trait_item) => trait_item.span,
-            Annotatable::ImplItem(impl_item) => impl_item.span,
+            Annotatable::AssocItem(assoc_item, _) => assoc_item.span,
             Annotatable::ForeignItem(foreign_item) => foreign_item.span,
             Annotatable::Stmt(stmt) => stmt.span,
             Annotatable::Expr(expr) => expr.span,
@@ -75,8 +76,7 @@ impl Annotatable {
     pub fn visit_attrs(&mut self, f: impl FnOnce(&mut AttrVec)) {
         match self {
             Annotatable::Item(item) => item.visit_attrs(f),
-            Annotatable::TraitItem(trait_item) => trait_item.visit_attrs(f),
-            Annotatable::ImplItem(impl_item) => impl_item.visit_attrs(f),
+            Annotatable::AssocItem(assoc_item, _) => assoc_item.visit_attrs(f),
             Annotatable::ForeignItem(foreign_item) => foreign_item.visit_attrs(f),
             Annotatable::Stmt(stmt) => stmt.visit_attrs(f),
             Annotatable::Expr(expr) => expr.visit_attrs(f),
@@ -94,8 +94,7 @@ impl Annotatable {
     pub fn visit_with<'a, V: Visitor<'a>>(&'a self, visitor: &mut V) -> V::Result {
         match self {
             Annotatable::Item(item) => visitor.visit_item(item),
-            Annotatable::TraitItem(item) => visitor.visit_assoc_item(item, AssocCtxt::Trait),
-            Annotatable::ImplItem(item) => visitor.visit_assoc_item(item, AssocCtxt::Impl),
+            Annotatable::AssocItem(item, ctxt) => visitor.visit_assoc_item(item, *ctxt),
             Annotatable::ForeignItem(foreign_item) => visitor.visit_foreign_item(foreign_item),
             Annotatable::Stmt(stmt) => visitor.visit_stmt(stmt),
             Annotatable::Expr(expr) => visitor.visit_expr(expr),
@@ -113,9 +112,7 @@ impl Annotatable {
     pub fn to_tokens(&self) -> TokenStream {
         match self {
             Annotatable::Item(node) => TokenStream::from_ast(node),
-            Annotatable::TraitItem(node) | Annotatable::ImplItem(node) => {
-                TokenStream::from_ast(node)
-            }
+            Annotatable::AssocItem(node, _) => TokenStream::from_ast(node),
             Annotatable::ForeignItem(node) => TokenStream::from_ast(node),
             Annotatable::Stmt(node) => {
                 assert!(!matches!(node.kind, ast::StmtKind::Empty));
@@ -142,14 +139,14 @@ impl Annotatable {
 
     pub fn expect_trait_item(self) -> P<ast::AssocItem> {
         match self {
-            Annotatable::TraitItem(i) => i,
+            Annotatable::AssocItem(i, AssocCtxt::Trait) => i,
             _ => panic!("expected Item"),
         }
     }
 
     pub fn expect_impl_item(self) -> P<ast::AssocItem> {
         match self {
-            Annotatable::ImplItem(i) => i,
+            Annotatable::AssocItem(i, AssocCtxt::Impl) => i,
             _ => panic!("expected Item"),
         }
     }
@@ -355,6 +352,10 @@ where
     ) -> MacroExpanderResult<'cx> {
         self(ecx, span, input)
     }
+}
+
+pub trait GlobDelegationExpander {
+    fn expand(&self, ecx: &mut ExtCtxt<'_>) -> ExpandResult<Vec<(Ident, Option<Ident>)>, ()>;
 }
 
 // Use a macro because forwarding to a simple function has type system issues
@@ -714,6 +715,9 @@ pub enum SyntaxExtensionKind {
         /// The produced AST fragment is appended to the input AST fragment.
         Box<dyn MultiItemModifier + sync::DynSync + sync::DynSend>,
     ),
+
+    /// A glob delegation.
+    GlobDelegation(Box<dyn GlobDelegationExpander + sync::DynSync + sync::DynSend>),
 }
 
 /// A struct representing a macro definition in "lowered" form ready for expansion.
@@ -748,7 +752,9 @@ impl SyntaxExtension {
     /// Returns which kind of macro calls this syntax extension.
     pub fn macro_kind(&self) -> MacroKind {
         match self.kind {
-            SyntaxExtensionKind::Bang(..) | SyntaxExtensionKind::LegacyBang(..) => MacroKind::Bang,
+            SyntaxExtensionKind::Bang(..)
+            | SyntaxExtensionKind::LegacyBang(..)
+            | SyntaxExtensionKind::GlobDelegation(..) => MacroKind::Bang,
             SyntaxExtensionKind::Attr(..)
             | SyntaxExtensionKind::LegacyAttr(..)
             | SyntaxExtensionKind::NonMacroAttr => MacroKind::Attr,
@@ -922,6 +928,32 @@ impl SyntaxExtension {
         SyntaxExtension::default(SyntaxExtensionKind::NonMacroAttr, edition)
     }
 
+    pub fn glob_delegation(
+        trait_def_id: DefId,
+        impl_def_id: LocalDefId,
+        edition: Edition,
+    ) -> SyntaxExtension {
+        struct GlobDelegationExpanderImpl {
+            trait_def_id: DefId,
+            impl_def_id: LocalDefId,
+        }
+        impl GlobDelegationExpander for GlobDelegationExpanderImpl {
+            fn expand(
+                &self,
+                ecx: &mut ExtCtxt<'_>,
+            ) -> ExpandResult<Vec<(Ident, Option<Ident>)>, ()> {
+                match ecx.resolver.glob_delegation_suffixes(self.trait_def_id, self.impl_def_id) {
+                    Ok(suffixes) => ExpandResult::Ready(suffixes),
+                    Err(Indeterminate) if ecx.force_mode => ExpandResult::Ready(Vec::new()),
+                    Err(Indeterminate) => ExpandResult::Retry(()),
+                }
+            }
+        }
+
+        let expander = GlobDelegationExpanderImpl { trait_def_id, impl_def_id };
+        SyntaxExtension::default(SyntaxExtensionKind::GlobDelegation(Box::new(expander)), edition)
+    }
+
     pub fn expn_data(
         &self,
         parent: LocalExpnId,
@@ -1030,6 +1062,16 @@ pub trait ResolverExpand {
 
     /// Tools registered with `#![register_tool]` and used by tool attributes and lints.
     fn registered_tools(&self) -> &RegisteredTools;
+
+    /// Mark this invocation id as a glob delegation.
+    fn register_glob_delegation(&mut self, invoc_id: LocalExpnId);
+
+    /// Names of specific methods to which glob delegation expands.
+    fn glob_delegation_suffixes(
+        &mut self,
+        trait_def_id: DefId,
+        impl_def_id: LocalDefId,
+    ) -> Result<Vec<(Ident, Option<Ident>)>, Indeterminate>;
 }
 
 pub trait LintStoreExpand {
@@ -1135,7 +1177,7 @@ impl<'a> ExtCtxt<'a> {
         }
     }
 
-    pub fn dcx(&self) -> &'a DiagCtxt {
+    pub fn dcx(&self) -> DiagCtxtHandle<'a> {
         self.sess.dcx()
     }
 
@@ -1256,7 +1298,7 @@ pub fn resolve_path(sess: &Session, path: impl Into<PathBuf>, span: Span) -> PRe
 }
 
 pub fn parse_macro_name_and_helper_attrs(
-    dcx: &rustc_errors::DiagCtxt,
+    dcx: DiagCtxtHandle<'_>,
     attr: &Attribute,
     macro_type: &str,
 ) -> Option<(Symbol, Vec<Symbol>)> {
@@ -1264,12 +1306,12 @@ pub fn parse_macro_name_and_helper_attrs(
     // that it's of the form `#[proc_macro_derive(Foo)]` or
     // `#[proc_macro_derive(Foo, attributes(A, ..))]`
     let list = attr.meta_item_list()?;
-    if list.len() != 1 && list.len() != 2 {
+    let ([trait_attr] | [trait_attr, _]) = list.as_slice() else {
         dcx.emit_err(errors::AttrNoArguments { span: attr.span });
         return None;
-    }
-    let Some(trait_attr) = list[0].meta_item() else {
-        dcx.emit_err(errors::NotAMetaItem { span: list[0].span() });
+    };
+    let Some(trait_attr) = trait_attr.meta_item() else {
+        dcx.emit_err(errors::NotAMetaItem { span: trait_attr.span() });
         return None;
     };
     let trait_ident = match trait_attr.ident() {
@@ -1356,9 +1398,7 @@ fn pretty_printing_compatibility_hack(item: &Item, sess: &Session) {
         };
 
         if crate_matches {
-            // FIXME: make this translatable
-            #[allow(rustc::untranslatable_diagnostic)]
-            sess.psess.dcx.emit_fatal(errors::ProcMacroBackCompat {
+            sess.dcx().emit_fatal(errors::ProcMacroBackCompat {
                 crate_name: "rental".to_string(),
                 fixed_version: "0.5.6".to_string(),
             });

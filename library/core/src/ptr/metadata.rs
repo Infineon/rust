@@ -2,10 +2,9 @@
 
 use crate::fmt;
 use crate::hash::{Hash, Hasher};
-use crate::intrinsics::aggregate_raw_ptr;
-#[cfg(not(bootstrap))]
-use crate::intrinsics::ptr_metadata;
+use crate::intrinsics::{aggregate_raw_ptr, ptr_metadata};
 use crate::marker::Freeze;
+use crate::ptr::NonNull;
 
 /// Provides the pointer metadata type of any pointed-to type.
 ///
@@ -81,7 +80,7 @@ pub trait Pointee {
 // NOTE: don’t stabilize this before trait aliases are stable in the language?
 pub trait Thin = Pointee<Metadata = ()>;
 
-/// Extract the metadata component of a pointer.
+/// Extracts the metadata component of a pointer.
 ///
 /// Values of type `*mut T`, `&T`, or `&mut T` can be passed directly to this function
 /// as they implicitly coerce to `*const T`.
@@ -96,17 +95,7 @@ pub trait Thin = Pointee<Metadata = ()>;
 #[rustc_const_unstable(feature = "ptr_metadata", issue = "81513")]
 #[inline]
 pub const fn metadata<T: ?Sized>(ptr: *const T) -> <T as Pointee>::Metadata {
-    #[cfg(bootstrap)]
-    {
-        // SAFETY: Accessing the value from the `PtrRepr` union is safe since *const T
-        // and PtrComponents<T> have the same memory layouts. Only std can make this
-        // guarantee.
-        unsafe { PtrRepr { const_ptr: ptr }.components.metadata }
-    }
-    #[cfg(not(bootstrap))]
-    {
-        ptr_metadata(ptr)
-    }
+    ptr_metadata(ptr)
 }
 
 /// Forms a (possibly-wide) raw pointer from a data pointer and metadata.
@@ -140,33 +129,6 @@ pub const fn from_raw_parts_mut<T: ?Sized>(
     aggregate_raw_ptr(data_pointer, metadata)
 }
 
-#[repr(C)]
-#[cfg(bootstrap)]
-union PtrRepr<T: ?Sized> {
-    const_ptr: *const T,
-    mut_ptr: *mut T,
-    components: PtrComponents<T>,
-}
-
-#[repr(C)]
-#[cfg(bootstrap)]
-struct PtrComponents<T: ?Sized> {
-    data_pointer: *const (),
-    metadata: <T as Pointee>::Metadata,
-}
-
-// Manual impl needed to avoid `T: Copy` bound.
-#[cfg(bootstrap)]
-impl<T: ?Sized> Copy for PtrComponents<T> {}
-
-// Manual impl needed to avoid `T: Clone` bound.
-#[cfg(bootstrap)]
-impl<T: ?Sized> Clone for PtrComponents<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
 /// The metadata for a `Dyn = dyn SomeTrait` trait object type.
 ///
 /// It is a pointer to a vtable (virtual call table)
@@ -191,7 +153,7 @@ impl<T: ?Sized> Clone for PtrComponents<T> {
 /// compare equal (since identical vtables can be deduplicated within a codegen unit).
 #[lang = "dyn_metadata"]
 pub struct DynMetadata<Dyn: ?Sized> {
-    _vtable_ptr: &'static VTable,
+    _vtable_ptr: NonNull<VTable>,
     _phantom: crate::marker::PhantomData<Dyn>,
 }
 
@@ -204,15 +166,18 @@ extern "C" {
 }
 
 impl<Dyn: ?Sized> DynMetadata<Dyn> {
-    /// One of the things that rustc_middle does with this being a lang item is
-    /// give it `FieldsShape::Primitive`, which means that as far as codegen can
-    /// tell, it *is* a reference, and thus doesn't have any fields.
-    /// That means we can't use field access, and have to transmute it instead.
+    /// When `DynMetadata` appears as the metadata field of a wide pointer, the rustc_middle layout
+    /// computation does magic and the resulting layout is *not* a `FieldsShape::Aggregate`, instead
+    /// it is a `FieldsShape::Primitive`. This means that the same type can have different layout
+    /// depending on whether it appears as the metadata field of a wide pointer or as a stand-alone
+    /// type, which understandably confuses codegen and leads to ICEs when trying to project to a
+    /// field of `DynMetadata`. To work around that issue, we use `transmute` instead of using a
+    /// field projection.
     #[inline]
     fn vtable_ptr(self) -> *const VTable {
         // SAFETY: this layout assumption is hard-coded into the compiler.
         // If it's somehow not a size match, the transmute will error.
-        unsafe { crate::mem::transmute::<Self, &'static VTable>(self) }
+        unsafe { crate::mem::transmute::<Self, *const VTable>(self) }
     }
 
     /// Returns the size of the type associated with this vtable.
@@ -222,14 +187,14 @@ impl<Dyn: ?Sized> DynMetadata<Dyn> {
         // Consider a reference like `&(i32, dyn Send)`: the vtable will only store the size of the
         // `Send` part!
         // SAFETY: DynMetadata always contains a valid vtable pointer
-        return unsafe { crate::intrinsics::vtable_size(self.vtable_ptr() as *const ()) };
+        unsafe { crate::intrinsics::vtable_size(self.vtable_ptr() as *const ()) }
     }
 
     /// Returns the alignment of the type associated with this vtable.
     #[inline]
     pub fn align_of(self) -> usize {
         // SAFETY: DynMetadata always contains a valid vtable pointer
-        return unsafe { crate::intrinsics::vtable_align(self.vtable_ptr() as *const ()) };
+        unsafe { crate::intrinsics::vtable_align(self.vtable_ptr() as *const ()) }
     }
 
     /// Returns the size and alignment together as a `Layout`

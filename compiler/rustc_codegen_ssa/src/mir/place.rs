@@ -1,18 +1,17 @@
-use super::operand::OperandValue;
-use super::{FunctionCx, LocalRef};
-
-use crate::common::IntPredicate;
-use crate::size_of_val;
-use crate::traits::*;
-
-use rustc_middle::bug;
-use rustc_middle::mir;
 use rustc_middle::mir::tcx::PlaceTy;
 use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, Ty};
-use rustc_target::abi::{Align, FieldsShape, Int, Pointer, Size, TagEncoding};
-use rustc_target::abi::{VariantIdx, Variants};
+use rustc_middle::{bug, mir};
+use rustc_target::abi::{
+    Align, FieldsShape, Int, Pointer, Size, TagEncoding, VariantIdx, Variants,
+};
 use tracing::{debug, instrument};
+
+use super::operand::OperandValue;
+use super::{FunctionCx, LocalRef};
+use crate::common::IntPredicate;
+use crate::size_of_val;
+use crate::traits::*;
 
 /// The location and extra runtime properties of the place.
 ///
@@ -55,7 +54,7 @@ impl<V: CodegenObject> PlaceValue<V> {
 
     /// Creates a `PlaceRef` to this location with the given type.
     pub fn with_type<'tcx>(self, layout: TyAndLayout<'tcx>) -> PlaceRef<'tcx, V> {
-        debug_assert!(
+        assert!(
             layout.is_unsized() || layout.abi.is_uninhabited() || self.llextra.is_none(),
             "Had pointer metadata {:?} for sized type {layout:?}",
             self.llextra,
@@ -109,8 +108,16 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         bx: &mut Bx,
         layout: TyAndLayout<'tcx>,
     ) -> Self {
+        Self::alloca_size(bx, layout.size, layout)
+    }
+
+    pub fn alloca_size<Bx: BuilderMethods<'a, 'tcx, Value = V>>(
+        bx: &mut Bx,
+        size: Size,
+        layout: TyAndLayout<'tcx>,
+    ) -> Self {
         assert!(layout.is_sized(), "tried to statically allocate unsized place");
-        PlaceValue::alloca(bx, layout.size, layout.align.abi).with_type(layout)
+        PlaceValue::alloca(bx, size, layout.align.abi).with_type(layout)
     }
 
     /// Returns a place for an indirect reference to an unsized place.
@@ -480,7 +487,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             cg_base = match *elem {
                 mir::ProjectionElem::Deref => bx.load_operand(cg_base).deref(bx.cx()),
                 mir::ProjectionElem::Field(ref field, _) => {
-                    debug_assert!(
+                    assert!(
                         !cg_base.layout.ty.is_any_ptr(),
                         "Bad PlaceRef: destructing pointers should use cast/PtrMetadata, \
                          but tried to access field {field:?} of pointer {cg_base:?}",

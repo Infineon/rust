@@ -1,9 +1,8 @@
 //! Conversion of internal Rust compiler `mir` items to stable ones.
 
-use rustc_middle::bug;
-use rustc_middle::mir;
 use rustc_middle::mir::interpret::alloc_range;
 use rustc_middle::mir::mono::MonoItem;
+use rustc_middle::{bug, mir};
 use stable_mir::mir::alloc::GlobalAlloc;
 use stable_mir::mir::{ConstOperand, Statement, UserTypeProjection, VarDebugInfoFragment};
 use stable_mir::ty::{Allocation, ConstantKind, MirConst};
@@ -175,7 +174,7 @@ impl<'tcx> Stable<'tcx> for mir::Rvalue<'tcx> {
             ThreadLocalRef(def_id) => {
                 stable_mir::mir::Rvalue::ThreadLocalRef(tables.crate_item(*def_id))
             }
-            AddressOf(mutability, place) => {
+            RawPtr(mutability, place) => {
                 stable_mir::mir::Rvalue::AddressOf(mutability.stable(tables), place.stable(tables))
             }
             Len(place) => stable_mir::mir::Rvalue::Len(place.stable(tables)),
@@ -328,13 +327,13 @@ impl<'tcx> Stable<'tcx> for mir::Operand<'tcx> {
 }
 
 impl<'tcx> Stable<'tcx> for mir::ConstOperand<'tcx> {
-    type T = stable_mir::mir::Constant;
+    type T = stable_mir::mir::ConstOperand;
 
     fn stable(&self, tables: &mut Tables<'_>) -> Self::T {
-        stable_mir::mir::Constant {
+        stable_mir::mir::ConstOperand {
             span: self.span.stable(tables),
             user_ty: self.user_ty.map(|u| u.as_usize()).or(None),
-            literal: self.const_.stable(tables),
+            const_: self.const_.stable(tables),
         }
     }
 }
@@ -644,6 +643,7 @@ impl<'tcx> Stable<'tcx> for mir::TerminatorKind<'tcx> {
                 target: target.map(|t| t.as_usize()),
                 unwind: unwind.stable(tables),
             },
+            mir::TerminatorKind::TailCall { func: _, args: _, fn_span: _ } => todo!(),
             mir::TerminatorKind::Assert { cond, expected, msg, target, unwind } => {
                 TerminatorKind::Assert {
                     cond: cond.stable(tables),
@@ -709,7 +709,7 @@ impl<'tcx> Stable<'tcx> for mir::interpret::GlobalAlloc<'tcx> {
 
     fn stable(&self, tables: &mut Tables<'_>) -> Self::T {
         match self {
-            mir::interpret::GlobalAlloc::Function(instance) => {
+            mir::interpret::GlobalAlloc::Function { instance, .. } => {
                 GlobalAlloc::Function(instance.stable(tables))
             }
             mir::interpret::GlobalAlloc::VTable(ty, trait_ref) => {
@@ -729,9 +729,9 @@ impl<'tcx> Stable<'tcx> for rustc_middle::mir::Const<'tcx> {
     fn stable(&self, tables: &mut Tables<'_>) -> Self::T {
         let id = tables.intern_mir_const(tables.tcx.lift(*self).unwrap());
         match *self {
-            mir::Const::Ty(c) => MirConst::new(
+            mir::Const::Ty(ty, c) => MirConst::new(
                 stable_mir::ty::ConstantKind::Ty(c.stable(tables)),
-                c.ty().stable(tables),
+                ty.stable(tables),
                 id,
             ),
             mir::Const::Unevaluated(unev_const, ty) => {

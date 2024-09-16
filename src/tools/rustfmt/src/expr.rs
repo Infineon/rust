@@ -5,6 +5,7 @@ use itertools::Itertools;
 use rustc_ast::token::{Delimiter, Lit, LitKind};
 use rustc_ast::{ast, ptr, token, ForLoopKind, MatchKind};
 use rustc_span::{BytePos, Span};
+use tracing::debug;
 
 use crate::chains::rewrite_chain;
 use crate::closures;
@@ -139,7 +140,17 @@ pub(crate) fn format_expr(
         | ast::ExprKind::While(..) => to_control_flow(expr, expr_type)
             .and_then(|control_flow| control_flow.rewrite(context, shape)),
         ast::ExprKind::ConstBlock(ref anon_const) => {
-            Some(format!("const {}", anon_const.rewrite(context, shape)?))
+            let rewrite = match anon_const.value.kind {
+                ast::ExprKind::Block(ref block, opt_label) => {
+                    // Inner attributes are associated with the `ast::ExprKind::ConstBlock` node,
+                    // not the `ast::Block` node we're about to rewrite. To prevent dropping inner
+                    // attributes call `rewrite_block` directly.
+                    // See https://github.com/rust-lang/rustfmt/issues/6158
+                    rewrite_block(block, Some(&expr.attrs), opt_label, context, shape)?
+                }
+                _ => anon_const.rewrite(context, shape)?,
+            };
+            Some(format!("const {}", rewrite))
         }
         ast::ExprKind::Block(ref block, opt_label) => {
             match expr_type {
@@ -253,14 +264,6 @@ pub(crate) fn format_expr(
             shape,
             SeparatorPlace::Front,
         ),
-        ast::ExprKind::Type(ref expr, ref ty) => rewrite_pair(
-            &**expr,
-            &**ty,
-            PairParts::infix(": "),
-            context,
-            shape,
-            SeparatorPlace::Back,
-        ),
         ast::ExprKind::Index(ref expr, ref index, _) => {
             rewrite_index(&**expr, &**index, context, shape)
         }
@@ -282,6 +285,9 @@ pub(crate) fn format_expr(
                 match lhs.kind {
                     ast::ExprKind::Lit(token_lit) => lit_ends_in_dot(&token_lit),
                     ast::ExprKind::Unary(_, ref expr) => needs_space_before_range(context, expr),
+                    ast::ExprKind::Binary(_, _, ref rhs_expr) => {
+                        needs_space_before_range(context, rhs_expr)
+                    }
                     _ => false,
                 }
             }
@@ -367,7 +373,7 @@ pub(crate) fn format_expr(
                 ))
             }
         }
-        ast::ExprKind::Gen(capture_by, ref block, ref kind) => {
+        ast::ExprKind::Gen(capture_by, ref block, ref kind, _) => {
             let mover = if matches!(capture_by, ast::CaptureBy::Value { .. }) {
                 "move "
             } else {
@@ -399,10 +405,14 @@ pub(crate) fn format_expr(
         }
         ast::ExprKind::Underscore => Some("_".to_owned()),
         ast::ExprKind::FormatArgs(..)
+        | ast::ExprKind::Type(..)
         | ast::ExprKind::IncludedBytes(..)
         | ast::ExprKind::OffsetOf(..) => {
-            // These do not occur in the AST because macros aren't expanded.
-            unreachable!()
+            // These don't normally occur in the AST because macros aren't expanded. However,
+            // rustfmt tries to parse macro arguments when formatting macros, so it's not totally
+            // impossible for rustfmt to come across one of these nodes when formatting a file.
+            // Also, rustfmt might get passed the output from `-Zunpretty=expanded`.
+            None
         }
         ast::ExprKind::Err(_) | ast::ExprKind::Dummy => None,
     };
@@ -452,7 +462,7 @@ fn rewrite_empty_block(
         return None;
     }
 
-    let label_str = rewrite_label(label);
+    let label_str = rewrite_label(context, label);
     if attrs.map_or(false, |a| !inner_attributes(a).is_empty()) {
         return None;
     }
@@ -517,7 +527,7 @@ fn rewrite_single_line_block(
     if let Some(block_expr) = stmt::Stmt::from_simple_block(context, block, attrs) {
         let expr_shape = shape.offset_left(last_line_width(prefix))?;
         let expr_str = block_expr.rewrite(context, expr_shape)?;
-        let label_str = rewrite_label(label);
+        let label_str = rewrite_label(context, label);
         let result = format!("{prefix}{label_str}{{ {expr_str} }}");
         if result.len() <= shape.width && !result.contains('\n') {
             return Some(result);
@@ -552,7 +562,7 @@ pub(crate) fn rewrite_block_with_visitor(
     }
 
     let inner_attrs = attrs.map(inner_attributes);
-    let label_str = rewrite_label(label);
+    let label_str = rewrite_label(context, label);
     visitor.visit_block(block, inner_attrs.as_deref(), has_braces);
     let visitor_context = visitor.get_context();
     context
@@ -929,7 +939,7 @@ impl<'a> ControlFlow<'a> {
             fresh_shape
         };
 
-        let label_string = rewrite_label(self.label);
+        let label_string = rewrite_label(context, self.label);
         // 1 = space after keyword.
         let offset = self.keyword.len() + label_string.len() + 1;
 
@@ -1158,9 +1168,9 @@ impl<'a> Rewrite for ControlFlow<'a> {
     }
 }
 
-fn rewrite_label(opt_label: Option<ast::Label>) -> Cow<'static, str> {
+fn rewrite_label(context: &RewriteContext<'_>, opt_label: Option<ast::Label>) -> Cow<'static, str> {
     match opt_label {
-        Some(label) => Cow::from(format!("{}: ", label.ident)),
+        Some(label) => Cow::from(format!("{}: ", context.snippet(label.ident.span))),
         None => Cow::from(""),
     }
 }

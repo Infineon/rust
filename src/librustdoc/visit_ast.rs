@@ -1,23 +1,24 @@
 //! The Rust AST Visitor. Extracts useful information and massages it into a form
 //! usable for `clean`.
 
+use std::mem;
+
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, DefIdMap, LocalDefId, LocalDefIdSet};
 use rustc_hir::intravisit::{walk_body, walk_item, Visitor};
-use rustc_hir::{self as hir, TyKind};
-use rustc_hir::{Node, CRATE_HIR_ID};
+use rustc_hir::{self as hir, Node, TyKind, CRATE_HIR_ID};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::def_id::{CRATE_DEF_ID, LOCAL_CRATE};
 use rustc_span::hygiene::MacroKind;
 use rustc_span::symbol::{kw, sym, Symbol};
 use rustc_span::Span;
+use tracing::debug;
 
-use std::mem;
-
+use crate::clean::cfg::Cfg;
 use crate::clean::utils::{inherits_doc_hidden, should_ignore_res};
-use crate::clean::{cfg::Cfg, reexport_chain, AttributesExt, NestedAttributesExt};
+use crate::clean::{reexport_chain, AttributesExt, NestedAttributesExt};
 use crate::core;
 
 /// This module is used to store stuff from Rust's AST in a more convenient

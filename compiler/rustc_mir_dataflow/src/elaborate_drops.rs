@@ -1,3 +1,5 @@
+use std::{fmt, iter};
+
 use rustc_hir::lang_items::LangItem;
 use rustc_index::Idx;
 use rustc_middle::mir::patch::MirPatch;
@@ -5,12 +7,10 @@ use rustc_middle::mir::*;
 use rustc_middle::span_bug;
 use rustc_middle::traits::Reveal;
 use rustc_middle::ty::util::IntTypeExt;
-use rustc_middle::ty::GenericArgsRef;
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt};
 use rustc_span::source_map::Spanned;
 use rustc_span::DUMMY_SP;
 use rustc_target::abi::{FieldIdx, VariantIdx, FIRST_VARIANT};
-use std::{fmt, iter};
 use tracing::{debug, instrument};
 
 /// The value of an inserted drop flag.
@@ -155,11 +155,11 @@ pub trait DropElaborator<'a, 'tcx>: fmt::Debug {
 }
 
 #[derive(Debug)]
-struct DropCtxt<'l, 'b, 'tcx, D>
+struct DropCtxt<'a, 'b, 'tcx, D>
 where
     D: DropElaborator<'b, 'tcx>,
 {
-    elaborator: &'l mut D,
+    elaborator: &'a mut D,
 
     source_info: SourceInfo,
 
@@ -192,7 +192,7 @@ pub fn elaborate_drop<'b, 'tcx, D>(
     DropCtxt { elaborator, source_info, place, path, succ, unwind }.elaborate_drop(bb)
 }
 
-impl<'l, 'b, 'tcx, D> DropCtxt<'l, 'b, 'tcx, D>
+impl<'a, 'b, 'tcx, D> DropCtxt<'a, 'b, 'tcx, D>
 where
     D: DropElaborator<'b, 'tcx>,
     'tcx: 'b,
@@ -454,8 +454,7 @@ where
             });
         }
 
-        let skip_contents =
-            adt.is_union() || Some(adt.did()) == self.tcx().lang_items().manually_drop();
+        let skip_contents = adt.is_union() || adt.is_manually_drop();
         let contents_drop = if skip_contents {
             (self.succ, self.unwind)
         } else {
@@ -651,10 +650,8 @@ where
                         [ty.into()],
                         self.source_info.span,
                     ),
-                    args: vec![Spanned {
-                        node: Operand::Move(Place::from(ref_place)),
-                        span: DUMMY_SP,
-                    }],
+                    args: [Spanned { node: Operand::Move(Place::from(ref_place)), span: DUMMY_SP }]
+                        .into(),
                     destination: unit_temp,
                     target: Some(succ),
                     unwind: unwind.into_action(),
@@ -706,7 +703,7 @@ where
             statements: vec![
                 self.assign(
                     ptr,
-                    Rvalue::AddressOf(Mutability::Mut, tcx.mk_place_index(self.place, cur)),
+                    Rvalue::RawPtr(Mutability::Mut, tcx.mk_place_index(self.place, cur)),
                 ),
                 self.assign(
                     cur.into(),

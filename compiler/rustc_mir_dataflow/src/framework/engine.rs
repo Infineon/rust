@@ -1,34 +1,30 @@
 //! A solver for dataflow problems.
 
+use std::ffi::OsString;
+use std::path::PathBuf;
+
+use rustc_data_structures::work_queue::WorkQueue;
+use rustc_hir::def_id::DefId;
+use rustc_index::{Idx, IndexVec};
+use rustc_middle::bug;
+use rustc_middle::mir::{self, create_dump_file, dump_enabled, traversal, BasicBlock};
+use rustc_middle::ty::print::with_no_trimmed_paths;
+use rustc_middle::ty::TyCtxt;
+use rustc_span::symbol::{sym, Symbol};
+use tracing::{debug, error};
+use {rustc_ast as ast, rustc_graphviz as dot};
+
+use super::fmt::DebugWithContext;
+use super::{
+    graphviz, visit_results, Analysis, AnalysisDomain, Direction, GenKill, GenKillAnalysis,
+    GenKillSet, JoinSemiLattice, ResultsCursor, ResultsVisitor,
+};
 use crate::errors::{
     DuplicateValuesFor, PathMustEndInFilename, RequiresAnArgument, UnknownFormatter,
 };
 use crate::framework::BitSetExt;
 
-use std::ffi::OsString;
-use std::path::PathBuf;
-
-use rustc_ast as ast;
-use rustc_data_structures::work_queue::WorkQueue;
-use rustc_graphviz as dot;
-use rustc_hir::def_id::DefId;
-use rustc_index::{Idx, IndexVec};
-use rustc_middle::bug;
-use rustc_middle::mir::{self, traversal, BasicBlock};
-use rustc_middle::mir::{create_dump_file, dump_enabled};
-use rustc_middle::ty::print::with_no_trimmed_paths;
-use rustc_middle::ty::TyCtxt;
-use rustc_span::symbol::{sym, Symbol};
-use tracing::{debug, error};
-
-use super::fmt::DebugWithContext;
-use super::graphviz;
-use super::{
-    visit_results, Analysis, AnalysisDomain, Direction, GenKill, GenKillAnalysis, GenKillSet,
-    JoinSemiLattice, ResultsCursor, ResultsVisitor,
-};
-
-pub type EntrySets<'tcx, A> = IndexVec<BasicBlock, <A as AnalysisDomain<'tcx>>::Domain>;
+type EntrySets<'tcx, A> = IndexVec<BasicBlock, <A as AnalysisDomain<'tcx>>::Domain>;
 
 /// A dataflow analysis that has converged to fixpoint.
 #[derive(Clone)]
@@ -61,7 +57,7 @@ where
         &mut self,
         body: &'mir mir::Body<'tcx>,
         blocks: impl IntoIterator<Item = BasicBlock>,
-        vis: &mut impl ResultsVisitor<'mir, 'tcx, Self, FlowState = A::Domain>,
+        vis: &mut impl ResultsVisitor<'mir, 'tcx, Self, Domain = A::Domain>,
     ) {
         visit_results(body, blocks, self, vis)
     }
@@ -69,7 +65,7 @@ where
     pub fn visit_reachable_with<'mir>(
         &mut self,
         body: &'mir mir::Body<'tcx>,
-        vis: &mut impl ResultsVisitor<'mir, 'tcx, Self, FlowState = A::Domain>,
+        vis: &mut impl ResultsVisitor<'mir, 'tcx, Self, Domain = A::Domain>,
     ) {
         let blocks = mir::traversal::reachable(body);
         visit_results(body, blocks.map(|(bb, _)| bb), self, vis)

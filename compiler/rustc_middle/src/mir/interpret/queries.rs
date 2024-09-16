@@ -1,17 +1,16 @@
-use super::{
-    ErrorHandled, EvalToAllocationRawResult, EvalToConstValueResult, EvalToValTreeResult, GlobalId,
-};
-
-use crate::mir;
-use crate::query::TyCtxtEnsure;
-use crate::ty::visit::TypeVisitableExt;
-use crate::ty::GenericArgs;
-use crate::ty::{self, TyCtxt};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_session::lint;
 use rustc_span::{Span, DUMMY_SP};
 use tracing::{debug, instrument};
+
+use super::{
+    ErrorHandled, EvalToAllocationRawResult, EvalToConstValueResult, EvalToValTreeResult, GlobalId,
+};
+use crate::mir;
+use crate::query::TyCtxtEnsure;
+use crate::ty::visit::TypeVisitableExt;
+use crate::ty::{self, GenericArgs, TyCtxt};
 
 impl<'tcx> TyCtxt<'tcx> {
     /// Evaluates a constant without providing any generic parameters. This is useful to evaluate consts
@@ -73,7 +72,7 @@ impl<'tcx> TyCtxt<'tcx> {
             bug!("did not expect inference variables here");
         }
 
-        match ty::Instance::resolve(
+        match ty::Instance::try_resolve(
             self, param_env,
             // FIXME: maybe have a separate version for resolving mir::UnevaluatedConst?
             ct.def, ct.args,
@@ -106,7 +105,7 @@ impl<'tcx> TyCtxt<'tcx> {
             bug!("did not expect inference variables here");
         }
 
-        match ty::Instance::resolve(self, param_env, ct.def, ct.args) {
+        match ty::Instance::try_resolve(self, param_env, ct.def, ct.args) {
             Ok(Some(instance)) => {
                 let cid = GlobalId { instance, promoted: None };
                 self.const_eval_global_id_for_typeck(param_env, cid, span).inspect(|_| {
