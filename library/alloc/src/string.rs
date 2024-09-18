@@ -43,8 +43,6 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 use core::error::Error;
-use core::fmt;
-use core::hash;
 #[cfg(not(no_global_oom_handling))]
 use core::iter::from_fn;
 use core::iter::FusedIterator;
@@ -55,9 +53,8 @@ use core::ops::AddAssign;
 #[cfg(not(no_global_oom_handling))]
 use core::ops::Bound::{Excluded, Included, Unbounded};
 use core::ops::{self, Range, RangeBounds};
-use core::ptr;
-use core::slice;
 use core::str::pattern::Pattern;
+use core::{fmt, hash, ptr, slice};
 
 #[cfg(not(no_global_oom_handling))]
 use crate::alloc::Allocator;
@@ -511,6 +508,7 @@ impl String {
     // NB see the slice::hack module in slice.rs for more information
     #[inline]
     #[cfg(test)]
+    #[allow(missing_docs)]
     pub fn from_str(_: &str) -> String {
         panic!("not available with cfg(test)");
     }
@@ -660,6 +658,56 @@ impl String {
         }
 
         Cow::Owned(res)
+    }
+
+    /// Converts a [`Vec<u8>`] to a `String`, substituting invalid UTF-8
+    /// sequences with replacement characters.
+    ///
+    /// See [`from_utf8_lossy`] for more details.
+    ///
+    /// [`from_utf8_lossy`]: String::from_utf8_lossy
+    ///
+    /// Note that this function does not guarantee reuse of the original `Vec`
+    /// allocation.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// #![feature(string_from_utf8_lossy_owned)]
+    /// // some bytes, in a vector
+    /// let sparkle_heart = vec![240, 159, 146, 150];
+    ///
+    /// let sparkle_heart = String::from_utf8_lossy_owned(sparkle_heart);
+    ///
+    /// assert_eq!(String::from("💖"), sparkle_heart);
+    /// ```
+    ///
+    /// Incorrect bytes:
+    ///
+    /// ```
+    /// #![feature(string_from_utf8_lossy_owned)]
+    /// // some invalid bytes
+    /// let input: Vec<u8> = b"Hello \xF0\x90\x80World".into();
+    /// let output = String::from_utf8_lossy_owned(input);
+    ///
+    /// assert_eq!(String::from("Hello �World"), output);
+    /// ```
+    #[must_use]
+    #[cfg(not(no_global_oom_handling))]
+    #[unstable(feature = "string_from_utf8_lossy_owned", issue = "129436")]
+    pub fn from_utf8_lossy_owned(v: Vec<u8>) -> String {
+        if let Cow::Owned(string) = String::from_utf8_lossy(&v) {
+            string
+        } else {
+            // SAFETY: `String::from_utf8_lossy`'s contract ensures that if
+            // it returns a `Cow::Borrowed`, it is a valid UTF-8 string.
+            // Otherwise, it returns a new allocation of an owned `String`, with
+            // replacement characters for invalid sequences, which is returned
+            // above.
+            unsafe { String::from_utf8_unchecked(v) }
+        }
     }
 
     /// Decode a UTF-16–encoded vector `v` into a `String`, returning [`Err`]
@@ -903,7 +951,7 @@ impl String {
     /// let rebuilt = unsafe { String::from_raw_parts(ptr, len, cap) };
     /// assert_eq!(rebuilt, "hello");
     /// ```
-    #[must_use = "`self` will be dropped if the result is not used"]
+    #[must_use = "losing the pointer will leak memory"]
     #[unstable(feature = "vec_into_raw_parts", reason = "new API", issue = "65816")]
     pub fn into_raw_parts(self) -> (*mut u8, usize, usize) {
         self.vec.into_raw_parts()
@@ -1497,10 +1545,7 @@ impl String {
     /// ```
     #[cfg(not(no_global_oom_handling))]
     #[unstable(feature = "string_remove_matches", reason = "new API", issue = "72826")]
-    pub fn remove_matches<'a, P>(&'a mut self, pat: P)
-    where
-        P: for<'x> Pattern<'x>,
-    {
+    pub fn remove_matches<P: Pattern>(&mut self, pat: P) {
         use core::str::pattern::Searcher;
 
         let rejections = {
@@ -1984,6 +2029,9 @@ impl String {
     /// let x = String::from("bucket");
     /// let static_ref: &'static mut str = x.leak();
     /// assert_eq!(static_ref, "bucket");
+    /// # // FIXME(https://github.com/rust-lang/miri/issues/3670):
+    /// # // use -Zmiri-disable-leak-check instead of unleaking in tests meant to leak.
+    /// # drop(unsafe { Box::from_raw(static_ref) });
     /// ```
     #[stable(feature = "string_leak", since = "1.72.0")]
     #[inline]
@@ -2010,6 +2058,30 @@ impl FromUtf8Error {
     #[stable(feature = "from_utf8_error_as_bytes", since = "1.26.0")]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..]
+    }
+
+    /// Converts the bytes into a `String` lossily, substituting invalid UTF-8
+    /// sequences with replacement characters.
+    ///
+    /// See [`String::from_utf8_lossy`] for more details on replacement of
+    /// invalid sequences, and [`String::from_utf8_lossy_owned`] for the
+    /// `String` function which corresponds to this function.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(string_from_utf8_lossy_owned)]
+    /// // some invalid bytes
+    /// let input: Vec<u8> = b"Hello \xF0\x90\x80World".into();
+    /// let output = String::from_utf8(input).unwrap_or_else(|e| e.into_utf8_lossy());
+    ///
+    /// assert_eq!(String::from("Hello �World"), output);
+    /// ```
+    #[must_use]
+    #[cfg(not(no_global_oom_handling))]
+    #[unstable(feature = "string_from_utf8_lossy_owned", issue = "129436")]
+    pub fn into_utf8_lossy(self) -> String {
+        String::from_utf8_lossy_owned(self.bytes)
     }
 
     /// Returns the bytes that were attempted to convert to a `String`.
@@ -2285,35 +2357,41 @@ impl<'a> Extend<Cow<'a, str>> for String {
     reason = "API not fully fleshed out and ready to be stabilized",
     issue = "27721"
 )]
-impl<'a, 'b> Pattern<'a> for &'b String {
-    type Searcher = <&'b str as Pattern<'a>>::Searcher;
+impl<'b> Pattern for &'b String {
+    type Searcher<'a> = <&'b str as Pattern>::Searcher<'a>;
 
-    fn into_searcher(self, haystack: &'a str) -> <&'b str as Pattern<'a>>::Searcher {
+    fn into_searcher(self, haystack: &str) -> <&'b str as Pattern>::Searcher<'_> {
         self[..].into_searcher(haystack)
     }
 
     #[inline]
-    fn is_contained_in(self, haystack: &'a str) -> bool {
+    fn is_contained_in(self, haystack: &str) -> bool {
         self[..].is_contained_in(haystack)
     }
 
     #[inline]
-    fn is_prefix_of(self, haystack: &'a str) -> bool {
+    fn is_prefix_of(self, haystack: &str) -> bool {
         self[..].is_prefix_of(haystack)
     }
 
     #[inline]
-    fn strip_prefix_of(self, haystack: &'a str) -> Option<&'a str> {
+    fn strip_prefix_of(self, haystack: &str) -> Option<&str> {
         self[..].strip_prefix_of(haystack)
     }
 
     #[inline]
-    fn is_suffix_of(self, haystack: &'a str) -> bool {
+    fn is_suffix_of<'a>(self, haystack: &'a str) -> bool
+    where
+        Self::Searcher<'a>: core::str::pattern::ReverseSearcher<'a>,
+    {
         self[..].is_suffix_of(haystack)
     }
 
     #[inline]
-    fn strip_suffix_of(self, haystack: &'a str) -> Option<&'a str> {
+    fn strip_suffix_of<'a>(self, haystack: &'a str) -> Option<&'a str>
+    where
+        Self::Searcher<'a>: core::str::pattern::ReverseSearcher<'a>,
+    {
         self[..].strip_suffix_of(haystack)
     }
 }
@@ -2640,14 +2718,54 @@ impl ToString for i8 {
     }
 }
 
-#[doc(hidden)]
+// Generic/generated code can sometimes have multiple, nested references
+// for strings, including `&&&str`s that would never be written
+// by hand. This macro generates twelve layers of nested `&`-impl
+// for primitive strings.
 #[cfg(not(no_global_oom_handling))]
-#[stable(feature = "str_to_string_specialization", since = "1.9.0")]
-impl ToString for str {
-    #[inline]
-    fn to_string(&self) -> String {
-        String::from(self)
-    }
+macro_rules! to_string_str_wrap_in_ref {
+    {x $($x:ident)*} => {
+        &to_string_str_wrap_in_ref! { $($x)* }
+    };
+    {} => { str };
+}
+#[cfg(not(no_global_oom_handling))]
+macro_rules! to_string_expr_wrap_in_deref {
+    {$self:expr ; x $($x:ident)*} => {
+        *(to_string_expr_wrap_in_deref! { $self ; $($x)* })
+    };
+    {$self:expr ;} => { $self };
+}
+#[cfg(not(no_global_oom_handling))]
+macro_rules! to_string_str {
+    {$($($x:ident)*),+} => {
+        $(
+            #[doc(hidden)]
+            #[stable(feature = "str_to_string_specialization", since = "1.9.0")]
+            impl ToString for to_string_str_wrap_in_ref!($($x)*) {
+                #[inline]
+                fn to_string(&self) -> String {
+                    String::from(to_string_expr_wrap_in_deref!(self ; $($x)*))
+                }
+            }
+        )+
+    };
+}
+
+#[cfg(not(no_global_oom_handling))]
+to_string_str! {
+    x x x x x x x x x x x x,
+    x x x x x x x x x x x,
+    x x x x x x x x x x,
+    x x x x x x x x x,
+    x x x x x x x x,
+    x x x x x x x,
+    x x x x x x,
+    x x x x x,
+    x x x x,
+    x x x,
+    x x,
+    x,
 }
 
 #[doc(hidden)]

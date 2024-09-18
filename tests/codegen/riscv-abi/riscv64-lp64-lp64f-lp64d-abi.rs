@@ -1,4 +1,4 @@
-//@ compile-flags: --target riscv64gc-unknown-linux-gnu -O -C no-prepopulate-passes
+//@ compile-flags: --target riscv64gc-unknown-linux-gnu -O -C no-prepopulate-passes -C panic=abort
 //@ needs-llvm-components: riscv
 
 #![crate_type = "lib"]
@@ -18,6 +18,7 @@ impl Copy for i64 {}
 impl Copy for u64 {}
 impl Copy for f32 {}
 impl Copy for f64 {}
+impl<T> Copy for *mut T {}
 
 // CHECK: define void @f_void()
 #[no_mangle]

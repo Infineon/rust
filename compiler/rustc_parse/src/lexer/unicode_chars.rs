@@ -1,12 +1,12 @@
 //! Characters and their corresponding confusables were collected from
 //! <https://www.unicode.org/Public/security/10.0.0/confusables.txt>
 
+use rustc_span::symbol::kw;
+use rustc_span::{BytePos, Pos, Span};
+
 use super::StringReader;
-use crate::{
-    errors::TokenSubstitution,
-    token::{self, Delimiter},
-};
-use rustc_span::{symbol::kw, BytePos, Pos, Span};
+use crate::errors::TokenSubstitution;
+use crate::token::{self, Delimiter};
 
 #[rustfmt::skip] // for line breaks
 pub(super) const UNICODE_ARRAY: &[(char, &str, &str)] = &[
@@ -351,7 +351,7 @@ pub(super) fn check_for_substitution(
 
     let Some((_, ascii_name, token)) = ASCII_ARRAY.iter().find(|&&(s, _, _)| s == ascii_str) else {
         let msg = format!("substitution character not found for '{ch}'");
-        reader.psess.dcx.span_bug(span, msg);
+        reader.dcx().span_bug(span, msg);
     };
 
     // special help suggestion for "directed" double quotes

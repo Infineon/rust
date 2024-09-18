@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use rustc_ast::ast;
 use rustc_span::Span;
+use tracing::debug;
 
 use self::newline_style::apply_newline_style;
 use crate::comment::{CharClasses, FullCodeCharKind};
@@ -82,7 +83,7 @@ fn should_skip_module<T: FormatHandler>(
         let source_file = context.psess.span_to_file_contents(module.span);
         let src = source_file.src.as_ref().expect("SourceFile without src");
 
-        if is_generated_file(src) {
+        if is_generated_file(src, config) {
             return true;
         }
     }

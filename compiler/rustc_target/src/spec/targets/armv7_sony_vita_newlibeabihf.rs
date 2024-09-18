@@ -5,7 +5,7 @@ use crate::spec::{cvs, Cc, LinkerFlavor, Lld, RelocModel, Target, TargetOptions}
 ///
 /// Requires the VITASDK toolchain on the host system.
 
-pub fn target() -> Target {
+pub(crate) fn target() -> Target {
     let pre_link_args = TargetOptions::link_args(
         LinkerFlavor::Gnu(Cc::Yes, Lld::No),
         &["-Wl,-q", "-Wl,--pic-veneer"],
@@ -14,10 +14,12 @@ pub fn target() -> Target {
     Target {
         llvm_target: "thumbv7a-vita-eabihf".into(),
         metadata: crate::spec::TargetMetadata {
-            description: None,
-            tier: None,
-            host_tools: None,
-            std: None,
+            description: Some(
+                "Armv7-A Cortex-A9 Sony PlayStation Vita (requires VITASDK toolchain)".into(),
+            ),
+            tier: Some(3),
+            host_tools: Some(false),
+            std: Some(true),
         },
         pointer_width: 32,
         data_layout: "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64".into(),

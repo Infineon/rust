@@ -1,21 +1,15 @@
-use crate::{
-    hir::place::Place as HirPlace,
-    infer::canonical::Canonical,
-    traits::ObligationCause,
-    ty::{
-        self, tls, BoundVar, CanonicalPolyFnSig, ClosureSizeProfileData, GenericArgKind,
-        GenericArgs, GenericArgsRef, Ty, UserArgs,
-    },
-};
+use std::collections::hash_map::Entry;
+use std::hash::Hash;
+use std::iter;
+
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_data_structures::unord::{ExtendUnord, UnordItems, UnordSet};
 use rustc_errors::ErrorGuaranteed;
+use rustc_hir::def::{DefKind, Res};
+use rustc_hir::def_id::{DefId, LocalDefId, LocalDefIdMap};
+use rustc_hir::hir_id::OwnerId;
 use rustc_hir::{
-    self as hir,
-    def::{DefKind, Res},
-    def_id::{DefId, LocalDefId, LocalDefIdMap},
-    hir_id::OwnerId,
-    BindingMode, ByRef, HirId, ItemLocalId, ItemLocalMap, ItemLocalSet, Mutability,
+    self as hir, BindingMode, ByRef, HirId, ItemLocalId, ItemLocalMap, ItemLocalSet, Mutability,
 };
 use rustc_index::IndexVec;
 use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
@@ -23,9 +17,15 @@ use rustc_middle::mir::FakeReadCause;
 use rustc_session::Session;
 use rustc_span::Span;
 use rustc_target::abi::{FieldIdx, VariantIdx};
-use std::{collections::hash_map::Entry, hash::Hash, iter};
 
 use super::RvalueScopes;
+use crate::hir::place::Place as HirPlace;
+use crate::infer::canonical::Canonical;
+use crate::traits::ObligationCause;
+use crate::ty::{
+    self, tls, BoundVar, CanonicalPolyFnSig, ClosureSizeProfileData, GenericArgKind, GenericArgs,
+    GenericArgsRef, Ty, UserArgs,
+};
 
 #[derive(TyEncodable, TyDecodable, Debug, HashStable)]
 pub struct TypeckResults<'tcx> {
@@ -217,10 +217,6 @@ pub struct TypeckResults<'tcx> {
 
     /// Container types and field indices of `offset_of!` expressions
     offset_of_data: ItemLocalMap<(Ty<'tcx>, Vec<(VariantIdx, FieldIdx)>)>,
-
-    /// Maps from `HirId`s of const blocks (the `ExprKind::ConstBlock`, not the inner expression's)
-    /// to the `DefId` of the corresponding inline const.
-    pub inline_consts: FxIndexMap<ItemLocalId, LocalDefId>,
 }
 
 impl<'tcx> TypeckResults<'tcx> {
@@ -253,7 +249,6 @@ impl<'tcx> TypeckResults<'tcx> {
             treat_byte_string_as_slice: Default::default(),
             closure_size_eval: Default::default(),
             offset_of_data: Default::default(),
-            inline_consts: Default::default(),
         }
     }
 
@@ -612,7 +607,9 @@ impl<'a, V> ::std::ops::Index<HirId> for LocalTableInContext<'a, V> {
     type Output = V;
 
     fn index(&self, key: HirId) -> &V {
-        self.get(key).expect("LocalTableInContext: key not found")
+        self.get(key).unwrap_or_else(|| {
+            bug!("LocalTableInContext({:?}): key {:?} not found", self.hir_owner, key)
+        })
     }
 }
 

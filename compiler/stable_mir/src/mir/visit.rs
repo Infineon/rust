@@ -108,8 +108,8 @@ pub trait MirVisitor {
         self.super_ty(ty)
     }
 
-    fn visit_constant(&mut self, constant: &Constant, location: Location) {
-        self.super_constant(constant, location)
+    fn visit_const_operand(&mut self, constant: &ConstOperand, location: Location) {
+        self.super_const_operand(constant, location)
     }
 
     fn visit_mir_const(&mut self, constant: &MirConst, location: Location) {
@@ -366,7 +366,7 @@ pub trait MirVisitor {
                 self.visit_place(place, PlaceContext::NON_MUTATING, location)
             }
             Operand::Constant(constant) => {
-                self.visit_constant(constant, location);
+                self.visit_const_operand(constant, location);
             }
         }
     }
@@ -380,10 +380,10 @@ pub trait MirVisitor {
         let _ = ty;
     }
 
-    fn super_constant(&mut self, constant: &Constant, location: Location) {
-        let Constant { span, user_ty: _, literal } = constant;
+    fn super_const_operand(&mut self, constant: &ConstOperand, location: Location) {
+        let ConstOperand { span, user_ty: _, const_ } = constant;
         self.visit_span(span);
-        self.visit_mir_const(literal, location);
+        self.visit_mir_const(const_, location);
     }
 
     fn super_mir_const(&mut self, constant: &MirConst, location: Location) {
@@ -463,6 +463,22 @@ impl Location {
     pub fn span(&self) -> Span {
         self.0
     }
+}
+
+/// Location of the statement at the given index for a given basic block. Assumes that `stmt_idx`
+/// and `bb_idx` are valid for a given body.
+pub fn statement_location(body: &Body, bb_idx: &BasicBlockIdx, stmt_idx: usize) -> Location {
+    let bb = &body.blocks[*bb_idx];
+    let stmt = &bb.statements[stmt_idx];
+    Location(stmt.span)
+}
+
+/// Location of the terminator for a given basic block. Assumes that `bb_idx` is valid for a given
+/// body.
+pub fn terminator_location(body: &Body, bb_idx: &BasicBlockIdx) -> Location {
+    let bb = &body.blocks[*bb_idx];
+    let terminator = &bb.terminator;
+    Location(terminator.span)
 }
 
 /// Reference to a place used to represent a partial projection.

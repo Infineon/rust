@@ -1,8 +1,8 @@
 use crate::clean::*;
 
 pub(crate) fn strip_item(mut item: Item) -> Item {
-    if !matches!(*item.kind, StrippedItem(..)) {
-        item.kind = Box::new(StrippedItem(item.kind));
+    if !matches!(item.inner.kind, StrippedItem(..)) {
+        item.inner.kind = StrippedItem(Box::new(item.inner.kind));
     }
     item
 }
@@ -78,15 +78,14 @@ pub(crate) trait DocFolder: Sized {
             | ImportItem(_)
             | FunctionItem(_)
             | TestItem(_)
-            | OpaqueTyItem(_)
             | StaticItem(_)
-            | ConstantItem(_)
+            | ConstantItem(..)
             | TraitAliasItem(_)
             | TyMethodItem(_)
             | MethodItem(_, _)
             | StructFieldItem(_)
-            | ForeignFunctionItem(_)
-            | ForeignStaticItem(_)
+            | ForeignFunctionItem(..)
+            | ForeignStaticItem(..)
             | ForeignTypeItem
             | MacroItem(_)
             | ProcMacroItem(_)
@@ -101,10 +100,10 @@ pub(crate) trait DocFolder: Sized {
 
     /// don't override!
     fn fold_item_recur(&mut self, mut item: Item) -> Item {
-        item.kind = Box::new(match *item.kind {
+        item.inner.kind = match item.inner.kind {
             StrippedItem(box i) => StrippedItem(Box::new(self.fold_inner_recur(i))),
-            _ => self.fold_inner_recur(*item.kind),
-        });
+            _ => self.fold_inner_recur(item.inner.kind),
+        };
         item
     }
 

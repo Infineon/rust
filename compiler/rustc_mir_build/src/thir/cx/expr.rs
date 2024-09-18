@@ -1,31 +1,30 @@
-use crate::errors;
-use crate::thir::cx::region::Scope;
-use crate::thir::cx::Cx;
-use crate::thir::util::UserAnnotatedTyHelpers;
 use itertools::Itertools;
-use rustc_ast::LitKind;
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hir as hir;
 use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
 use rustc_index::Idx;
-use rustc_middle::hir::place::Place as HirPlace;
-use rustc_middle::hir::place::PlaceBase as HirPlaceBase;
-use rustc_middle::hir::place::ProjectionKind as HirProjectionKind;
+use rustc_middle::hir::place::{
+    Place as HirPlace, PlaceBase as HirPlaceBase, ProjectionKind as HirProjectionKind,
+};
 use rustc_middle::middle::region;
 use rustc_middle::mir::{self, BinOp, BorrowKind, UnOp};
 use rustc_middle::thir::*;
 use rustc_middle::ty::adjustment::{
     Adjust, Adjustment, AutoBorrow, AutoBorrowMutability, PointerCoercion,
 };
-use rustc_middle::ty::GenericArgs;
 use rustc_middle::ty::{
-    self, AdtKind, InlineConstArgs, InlineConstArgsParts, ScalarInt, Ty, UpvarArgs, UserType,
+    self, AdtKind, GenericArgs, InlineConstArgs, InlineConstArgsParts, ScalarInt, Ty, UpvarArgs,
+    UserType,
 };
 use rustc_middle::{bug, span_bug};
-use rustc_span::source_map::Spanned;
-use rustc_span::{sym, Span, DUMMY_SP};
+use rustc_span::{sym, Span};
 use rustc_target::abi::{FieldIdx, FIRST_VARIANT};
 use tracing::{debug, info, instrument, trace};
+
+use crate::errors;
+use crate::thir::cx::region::Scope;
+use crate::thir::cx::Cx;
+use crate::thir::util::UserAnnotatedTyHelpers;
 
 impl<'tcx> Cx<'tcx> {
     pub(crate) fn mirror_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) -> ExprId {
@@ -144,7 +143,7 @@ impl<'tcx> Cx<'tcx> {
                 arg: self.thir.exprs.push(expr),
             },
             Adjust::Borrow(AutoBorrow::RawPtr(mutability)) => {
-                ExprKind::AddressOf { mutability, arg: self.thir.exprs.push(expr) }
+                ExprKind::RawBorrow { mutability, arg: self.thir.exprs.push(expr) }
             }
             Adjust::DynStar => ExprKind::Cast { source: self.thir.exprs.push(expr) },
         };
@@ -219,12 +218,7 @@ impl<'tcx> Cx<'tcx> {
                     let lhs =
                         self.thir.exprs.push(Expr { temp_lifetime, ty: discr_ty, span, kind });
                     let bin = ExprKind::Binary { op: BinOp::Add, lhs, rhs: offset };
-                    self.thir.exprs.push(Expr {
-                        temp_lifetime,
-                        ty: discr_ty,
-                        span: span,
-                        kind: bin,
-                    })
+                    self.thir.exprs.push(Expr { temp_lifetime, ty: discr_ty, span, kind: bin })
                 }
                 None => offset,
             };
@@ -397,7 +391,7 @@ impl<'tcx> Cx<'tcx> {
             }
 
             hir::ExprKind::AddrOf(hir::BorrowKind::Raw, mutability, arg) => {
-                ExprKind::AddressOf { mutability, arg: self.mirror_expr(arg) }
+                ExprKind::RawBorrow { mutability, arg: self.mirror_expr(arg) }
             }
 
             hir::ExprKind::Block(blk, _) => ExprKind::Block { block: self.mirror_block(blk) },
@@ -671,9 +665,9 @@ impl<'tcx> Cx<'tcx> {
                 ExprKind::OffsetOf { container, fields }
             }
 
-            hir::ExprKind::ConstBlock(body) => {
-                let ty = self.typeck_results().node_type(body.hir_id);
-                let did = self.typeck_results().inline_consts[&expr.hir_id.local_id].into();
+            hir::ExprKind::ConstBlock(ref anon_const) => {
+                let ty = self.typeck_results().node_type(anon_const.hir_id);
+                let did = anon_const.def_id.to_def_id();
                 let typeck_root_def_id = tcx.typeck_root_def_id(did);
                 let parent_args =
                     tcx.erase_regions(GenericArgs::identity_for_item(tcx, typeck_root_def_id));
@@ -712,7 +706,13 @@ impl<'tcx> Cx<'tcx> {
             hir::ExprKind::If(cond, then, else_opt) => ExprKind::If {
                 if_then_scope: region::Scope {
                     id: then.hir_id.local_id,
-                    data: region::ScopeData::IfThen,
+                    data: {
+                        if expr.span.at_least_rust_2024() && tcx.features().if_let_rescope {
+                            region::ScopeData::IfThenRescope
+                        } else {
+                            region::ScopeData::IfThen
+                        }
+                    },
                 },
                 cond: self.mirror_expr(cond),
                 then: self.mirror_expr(then),
@@ -899,14 +899,10 @@ impl<'tcx> Cx<'tcx> {
                 let hir_id = self.tcx.local_def_id_to_hir_id(def_id.expect_local());
                 let generics = self.tcx.generics_of(hir_id.owner);
                 let Some(&index) = generics.param_def_id_to_index.get(&def_id) else {
-                    let guar = self.tcx.dcx().has_errors().unwrap();
-                    // We already errored about a late bound const
-
-                    let lit = self
-                        .tcx
-                        .hir_arena
-                        .alloc(Spanned { span: DUMMY_SP, node: LitKind::Err(guar) });
-                    return ExprKind::Literal { lit, neg: false };
+                    span_bug!(
+                        expr.span,
+                        "Should have already errored about late bound consts: {def_id:?}"
+                    );
                 };
                 let name = self.tcx.hir().name(hir_id);
                 let param = ty::ParamConst::new(index, name);
@@ -939,9 +935,11 @@ impl<'tcx> Cx<'tcx> {
                 }
             }
 
-            // We encode uses of statics as a `*&STATIC` where the `&STATIC` part is
-            // a constant reference (or constant raw pointer for `static mut`) in MIR
+            // A source Rust `path::to::STATIC` is a place expr like *&ident is.
+            // In THIR, we make them exactly equivalent by inserting the implied *& or *&raw,
+            // but distinguish between &STATIC and &THREAD_LOCAL as they have different semantics
             Res::Def(DefKind::Static { .. }, id) => {
+                // this is &raw for extern static or static mut, and & for other statics
                 let ty = self.tcx.static_ptr_ty(id);
                 let temp_lifetime = self
                     .rvalue_scopes

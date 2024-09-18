@@ -1,9 +1,8 @@
 //! Ways to create a `str` from bytes slice.
 
-use crate::{mem, ptr};
-
 use super::validations::run_utf8_validation;
 use super::Utf8Error;
+use crate::{mem, ptr};
 
 /// Converts a slice of bytes to a string slice.
 ///
@@ -86,7 +85,7 @@ use super::Utf8Error;
 #[rustc_allow_const_fn_unstable(str_internals)]
 #[rustc_diagnostic_item = "str_from_utf8"]
 pub const fn from_utf8(v: &[u8]) -> Result<&str, Utf8Error> {
-    // FIXME: This should use `?` again, once it's `const`
+    // FIXME(const-hack): This should use `?` again, once it's `const`
     match run_utf8_validation(v) {
         Ok(_) => {
             // SAFETY: validation succeeded.
@@ -130,7 +129,7 @@ pub const fn from_utf8(v: &[u8]) -> Result<&str, Utf8Error> {
 #[rustc_const_unstable(feature = "const_str_from_utf8", issue = "91006")]
 #[rustc_diagnostic_item = "str_from_utf8_mut"]
 pub const fn from_utf8_mut(v: &mut [u8]) -> Result<&mut str, Utf8Error> {
-    // This should use `?` again, once it's `const`
+    // FIXME(const-hack): This should use `?` again, once it's `const`
     match run_utf8_validation(v) {
         Ok(_) => {
             // SAFETY: validation succeeded.
@@ -206,7 +205,7 @@ pub const unsafe fn from_utf8_unchecked_mut(v: &mut [u8]) -> &mut str {
     unsafe { &mut *(v as *mut [u8] as *mut str) }
 }
 
-/// Creates an `&str` from a pointer and a length.
+/// Creates a `&str` from a pointer and a length.
 ///
 /// The pointed-to bytes must be valid UTF-8.
 /// If this might not be the case, use `str::from_utf8(slice::from_raw_parts(ptr, len))`,
@@ -225,7 +224,7 @@ pub const unsafe fn from_raw_parts<'a>(ptr: *const u8, len: usize) -> &'a str {
     unsafe { &*ptr::from_raw_parts(ptr, len) }
 }
 
-/// Creates an `&mut str` from a pointer and a length.
+/// Creates a `&mut str` from a pointer and a length.
 ///
 /// The pointed-to bytes must be valid UTF-8.
 /// If this might not be the case, use `str::from_utf8_mut(slice::from_raw_parts_mut(ptr, len))`,

@@ -1,34 +1,37 @@
-use super::potentially_plural_count;
-use crate::errors::{LifetimesOrBoundsMismatchOnTrait, MethodShouldReturnFuture};
 use core::ops::ControlFlow;
+use std::borrow::Cow;
+use std::iter;
+
 use hir::def_id::{DefId, DefIdMap, LocalDefId};
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
-use rustc_errors::{codes::*, pluralize, struct_span_code_err, Applicability, ErrorGuaranteed};
+use rustc_errors::codes::*;
+use rustc_errors::{pluralize, struct_span_code_err, Applicability, ErrorGuaranteed};
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::intravisit;
-use rustc_hir::{GenericParamKind, ImplItemKind};
+use rustc_hir::{intravisit, GenericParamKind, ImplItemKind};
 use rustc_infer::infer::outlives::env::OutlivesEnvironment;
 use rustc_infer::infer::{self, InferCtxt, TyCtxtInferExt};
 use rustc_infer::traits::util;
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
 use rustc_middle::ty::fold::BottomUpFolder;
 use rustc_middle::ty::util::ExplicitSelf;
-use rustc_middle::ty::Upcast;
 use rustc_middle::ty::{
-    self, GenericArgs, Ty, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt,
+    self, GenericArgs, GenericParamDefKind, Ty, TyCtxt, TypeFoldable, TypeFolder,
+    TypeSuperFoldable, TypeVisitableExt, Upcast,
 };
-use rustc_middle::ty::{GenericParamDefKind, TyCtxt};
 use rustc_middle::{bug, span_bug};
 use rustc_span::Span;
+use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
+use rustc_trait_selection::infer::InferCtxtExt;
 use rustc_trait_selection::regions::InferCtxtRegionExt;
-use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt;
 use rustc_trait_selection::traits::outlives_bounds::InferCtxtExt as _;
 use rustc_trait_selection::traits::{
     self, FulfillmentError, ObligationCause, ObligationCauseCode, ObligationCtxt, Reveal,
 };
-use std::borrow::Cow;
-use std::iter;
+use tracing::{debug, instrument};
+
+use super::potentially_plural_count;
+use crate::errors::{LifetimesOrBoundsMismatchOnTrait, MethodShouldReturnFuture};
 
 mod refine;
 
@@ -397,7 +400,7 @@ struct RemapLateBound<'a, 'tcx> {
 }
 
 impl<'tcx> TypeFolder<TyCtxt<'tcx>> for RemapLateBound<'_, 'tcx> {
-    fn interner(&self) -> TyCtxt<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 
@@ -723,7 +726,7 @@ pub(super) fn collect_return_position_impl_trait_in_trait_tys<'tcx>(
                     num_trait_args,
                     num_impl_args,
                     def_id,
-                    impl_def_id: impl_m.container_id(tcx),
+                    impl_m_def_id: impl_m.def_id,
                     ty,
                     return_span,
                 }) {
@@ -790,13 +793,13 @@ impl<'tcx, E> TypeFolder<TyCtxt<'tcx>> for ImplTraitInTraitCollector<'_, 'tcx, E
 where
     E: 'tcx,
 {
-    fn interner(&self) -> TyCtxt<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
         self.ocx.infcx.tcx
     }
 
     fn fold_ty(&mut self, ty: Ty<'tcx>) -> Ty<'tcx> {
         if let ty::Alias(ty::Projection, proj) = ty.kind()
-            && self.interner().is_impl_trait_in_trait(proj.def_id)
+            && self.cx().is_impl_trait_in_trait(proj.def_id)
         {
             if let Some((ty, _)) = self.types.get(&proj.def_id) {
                 return *ty;
@@ -810,9 +813,9 @@ where
             self.types.insert(proj.def_id, (infer_ty, proj.args));
             // Recurse into bounds
             for (pred, pred_span) in self
-                .interner()
+                .cx()
                 .explicit_item_bounds(proj.def_id)
-                .iter_instantiated_copied(self.interner(), proj.args)
+                .iter_instantiated_copied(self.cx(), proj.args)
             {
                 let pred = pred.fold_with(self);
                 let pred = self.ocx.normalize(
@@ -822,7 +825,7 @@ where
                 );
 
                 self.ocx.register_obligation(traits::Obligation::new(
-                    self.interner(),
+                    self.cx(),
                     ObligationCause::new(
                         self.span,
                         self.body_id,
@@ -841,19 +844,25 @@ where
 
 struct RemapHiddenTyRegions<'tcx> {
     tcx: TyCtxt<'tcx>,
+    /// Map from early/late params of the impl to identity regions of the RPITIT (GAT)
+    /// in the trait.
     map: FxIndexMap<ty::Region<'tcx>, ty::Region<'tcx>>,
     num_trait_args: usize,
     num_impl_args: usize,
+    /// Def id of the RPITIT (GAT) in the *trait*.
     def_id: DefId,
-    impl_def_id: DefId,
+    /// Def id of the impl method which owns the opaque hidden type we're remapping.
+    impl_m_def_id: DefId,
+    /// The hidden type we're remapping. Useful for diagnostics.
     ty: Ty<'tcx>,
+    /// Span of the return type. Useful for diagnostics.
     return_span: Span,
 }
 
 impl<'tcx> ty::FallibleTypeFolder<TyCtxt<'tcx>> for RemapHiddenTyRegions<'tcx> {
     type Error = ErrorGuaranteed;
 
-    fn interner(&self) -> TyCtxt<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 
@@ -882,8 +891,7 @@ impl<'tcx> ty::FallibleTypeFolder<TyCtxt<'tcx>> for RemapHiddenTyRegions<'tcx> {
             ty::ReLateParam(_) => {}
             // Remap early-bound regions as long as they don't come from the `impl` itself,
             // in which case we don't really need to renumber them.
-            ty::ReEarlyParam(ebr)
-                if ebr.index >= self.tcx.generics_of(self.impl_def_id).count() as u32 => {}
+            ty::ReEarlyParam(ebr) if ebr.index as usize >= self.num_impl_args => {}
             _ => return Ok(region),
         }
 
@@ -896,7 +904,7 @@ impl<'tcx> ty::FallibleTypeFolder<TyCtxt<'tcx>> for RemapHiddenTyRegions<'tcx> {
                 );
             }
         } else {
-            let guar = match region.opt_param_def_id(self.tcx, self.tcx.parent(self.def_id)) {
+            let guar = match region.opt_param_def_id(self.tcx, self.impl_m_def_id) {
                 Some(def_id) => {
                     let return_span = if let ty::Alias(ty::Opaque, opaque_ty) = self.ty.kind() {
                         self.tcx.def_span(opaque_ty.def_id)
@@ -981,7 +989,7 @@ fn report_trait_method_mismatch<'tcx>(
                 .next()
                 .unwrap_or(impl_err_span);
 
-            diag.span_suggestion(
+            diag.span_suggestion_verbose(
                 span,
                 "change the self-receiver type to match the trait",
                 sugg,
@@ -1005,12 +1013,12 @@ fn report_trait_method_mismatch<'tcx>(
                         }
                         hir::FnRetTy::Return(hir_ty) => {
                             let sugg = trait_sig.output();
-                            diag.span_suggestion(hir_ty.span, msg, sugg, ap);
+                            diag.span_suggestion_verbose(hir_ty.span, msg, sugg, ap);
                         }
                     };
                 };
             } else if let Some(trait_ty) = trait_sig.inputs().get(*i) {
-                diag.span_suggestion(
+                diag.span_suggestion_verbose(
                     impl_err_span,
                     "change the parameter type to match the trait",
                     trait_ty,
@@ -1035,7 +1043,7 @@ fn report_trait_method_mismatch<'tcx>(
         false,
     );
 
-    return diag.emit();
+    diag.emit()
 }
 
 fn check_region_bounds_on_impl_item<'tcx>(
@@ -1115,7 +1123,7 @@ fn check_region_bounds_on_impl_item<'tcx>(
             .dcx()
             .create_err(LifetimesOrBoundsMismatchOnTrait {
                 span,
-                item_kind: assoc_item_kind_str(&impl_m),
+                item_kind: impl_m.descr(),
                 ident: impl_m.ident(tcx),
                 generics_span,
                 bounds_span,
@@ -1292,7 +1300,7 @@ fn compare_number_of_generics<'tcx>(
         ("const", trait_own_counts.consts, impl_own_counts.consts),
     ];
 
-    let item_kind = assoc_item_kind_str(&impl_);
+    let item_kind = impl_.descr();
 
     let mut err_occurred = None;
     for (kind, trait_count, impl_count) in matchings {
@@ -1674,7 +1682,7 @@ fn compare_generic_param_kinds<'tcx>(
                 param_impl_span,
                 E0053,
                 "{} `{}` has an incompatible generic parameter for trait `{}`",
-                assoc_item_kind_str(&impl_item),
+                impl_item.descr(),
                 trait_item.name,
                 &tcx.def_path_str(tcx.parent(trait_item.def_id))
             );
@@ -1985,10 +1993,10 @@ pub(super) fn check_type_bounds<'tcx>(
     let infcx = tcx.infer_ctxt().build();
     let ocx = ObligationCtxt::new_with_diagnostics(&infcx);
 
-    // A synthetic impl Trait for RPITIT desugaring has no HIR, which we currently use to get the
-    // span for an impl's associated type. Instead, for these, use the def_span for the synthesized
-    // associated type.
-    let impl_ty_span = if impl_ty.is_impl_trait_in_trait() {
+    // A synthetic impl Trait for RPITIT desugaring or assoc type for effects desugaring has no HIR,
+    // which we currently use to get the span for an impl's associated type. Instead, for these,
+    // use the def_span for the synthesized  associated type.
+    let impl_ty_span = if impl_ty.is_impl_trait_in_trait() || impl_ty.is_effects_desugaring {
         tcx.def_span(impl_ty_def_id)
     } else {
         match tcx.hir_node_by_def_id(impl_ty_def_id) {
@@ -2032,7 +2040,7 @@ pub(super) fn check_type_bounds<'tcx>(
     // to its definition type. This should be the param-env we use to *prove* the
     // predicate too, but we don't do that because of performance issues.
     // See <https://github.com/rust-lang/rust/pull/117542#issue-1976337685>.
-    let trait_projection_ty = Ty::new_projection(tcx, trait_ty.def_id, rebased_args);
+    let trait_projection_ty = Ty::new_projection_from_args(tcx, trait_ty.def_id, rebased_args);
     let impl_identity_ty = tcx.type_of(impl_ty.def_id).instantiate_identity();
     let normalize_param_env = param_env_with_gat_bounds(tcx, impl_ty, impl_trait_ref);
     for mut obligation in util::elaborate(tcx, obligations) {
@@ -2072,7 +2080,7 @@ struct ReplaceTy<'tcx> {
 }
 
 impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReplaceTy<'tcx> {
-    fn interner(&self) -> TyCtxt<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 
@@ -2198,9 +2206,6 @@ fn param_env_with_gat_bounds<'tcx>(
                         tcx,
                         ty::INNERMOST,
                         ty::BoundVar::from_usize(bound_vars.len() - 1),
-                        tcx.type_of(param.def_id)
-                            .no_bound_vars()
-                            .expect("const parameter types cannot be generic"),
                     )
                     .into()
                 }
@@ -2233,7 +2238,11 @@ fn param_env_with_gat_bounds<'tcx>(
             _ => predicates.push(
                 ty::Binder::bind_with_vars(
                     ty::ProjectionPredicate {
-                        projection_term: ty::AliasTerm::new(tcx, trait_ty.def_id, rebased_args),
+                        projection_term: ty::AliasTerm::new_from_args(
+                            tcx,
+                            trait_ty.def_id,
+                            rebased_args,
+                        ),
                         term: normalize_impl_ty.into(),
                     },
                     bound_vars,
@@ -2244,14 +2253,6 @@ fn param_env_with_gat_bounds<'tcx>(
     }
 
     ty::ParamEnv::new(tcx.mk_clauses(&predicates), Reveal::UserFacing)
-}
-
-fn assoc_item_kind_str(impl_item: &ty::AssocItem) -> &'static str {
-    match impl_item.kind {
-        ty::AssocKind::Const => "const",
-        ty::AssocKind::Fn => "method",
-        ty::AssocKind::Type => "type",
-    }
 }
 
 /// Manually check here that `async fn foo()` wasn't matched against `fn foo()`,

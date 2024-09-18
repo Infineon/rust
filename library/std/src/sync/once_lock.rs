@@ -80,14 +80,21 @@ use crate::sync::Once;
 /// static LIST: OnceList<u32> = OnceList::new();
 /// static COUNTER: AtomicU32 = AtomicU32::new(0);
 ///
-/// let vec = (0..thread::available_parallelism().unwrap().get()).map(|_| thread::spawn(|| {
-///     while let i @ 0..=1000 = COUNTER.fetch_add(1, Ordering::Relaxed) {
-///         LIST.push(i);
+/// # const LEN: u32 = if cfg!(miri) { 50 } else { 1000 };
+/// # /*
+/// const LEN: u32 = 1000;
+/// # */
+/// thread::scope(|s| {
+///     for _ in 0..thread::available_parallelism().unwrap().get() {
+///         s.spawn(|| {
+///             while let i @ 0..LEN = COUNTER.fetch_add(1, Ordering::Relaxed) {
+///                 LIST.push(i);
+///             }
+///         });
 ///     }
-/// })).collect::<Vec<thread::JoinHandle<_>>>();
-/// vec.into_iter().for_each(|handle| handle.join().unwrap());
+/// });
 ///
-/// for i in 0..=1000 {
+/// for i in 0..LEN {
 ///     assert!(LIST.contains(&i));
 /// }
 ///
@@ -158,6 +165,34 @@ impl<T> OnceLock<T> {
         } else {
             None
         }
+    }
+
+    /// Blocks the current thread until the cell is initialized.
+    ///
+    /// # Example
+    ///
+    /// Waiting for a computation on another thread to finish:
+    /// ```rust
+    /// #![feature(once_wait)]
+    ///
+    /// use std::thread;
+    /// use std::sync::OnceLock;
+    ///
+    /// let value = OnceLock::new();
+    ///
+    /// thread::scope(|s| {
+    ///     s.spawn(|| value.set(1 + 1));
+    ///
+    ///     let result = value.wait();
+    ///     assert_eq!(result, &2);
+    /// })
+    /// ```
+    #[inline]
+    #[unstable(feature = "once_wait", issue = "127527")]
+    pub fn wait(&self) -> &T {
+        self.once.wait_force();
+
+        unsafe { self.get_unchecked() }
     }
 
     /// Sets the contents of this cell to `value`.
@@ -274,9 +309,7 @@ impl<T> OnceLock<T> {
     /// Gets the mutable reference of the contents of the cell, initializing
     /// it with `f` if the cell was empty.
     ///
-    /// Many threads may call `get_mut_or_init` concurrently with different
-    /// initializing functions, but it is guaranteed that only one function
-    /// will be executed.
+    /// This method never blocks.
     ///
     /// # Panics
     ///
@@ -365,6 +398,8 @@ impl<T> OnceLock<T> {
     /// Gets the mutable reference of the contents of the cell, initializing
     /// it with `f` if the cell was empty. If the cell was empty and `f` failed,
     /// an error is returned.
+    ///
+    /// This method never blocks.
     ///
     /// # Panics
     ///
@@ -463,6 +498,7 @@ impl<T> OnceLock<T> {
     }
 
     #[cold]
+    #[optimize(size)]
     fn initialize<F, E>(&self, f: F) -> Result<(), E>
     where
         F: FnOnce() -> Result<T, E>,
@@ -481,7 +517,7 @@ impl<T> OnceLock<T> {
                     res = Err(e);
 
                     // Treat the underlying `Once` as poisoned since we
-                    // failed to initialize our value. Calls
+                    // failed to initialize our value.
                     p.poison();
                 }
             }
@@ -495,7 +531,7 @@ impl<T> OnceLock<T> {
     #[inline]
     unsafe fn get_unchecked(&self) -> &T {
         debug_assert!(self.is_initialized());
-        (&*self.value.get()).assume_init_ref()
+        unsafe { (&*self.value.get()).assume_init_ref() }
     }
 
     /// # Safety
@@ -504,7 +540,7 @@ impl<T> OnceLock<T> {
     #[inline]
     unsafe fn get_unchecked_mut(&mut self) -> &mut T {
         debug_assert!(self.is_initialized());
-        (&mut *self.value.get()).assume_init_mut()
+        unsafe { (&mut *self.value.get()).assume_init_mut() }
     }
 }
 
@@ -571,7 +607,7 @@ impl<T: Clone> Clone for OnceLock<T> {
 
 #[stable(feature = "once_cell", since = "1.70.0")]
 impl<T> From<T> for OnceLock<T> {
-    /// Create a new cell with its contents set to `value`.
+    /// Creates a new cell with its contents set to `value`.
     ///
     /// # Example
     ///

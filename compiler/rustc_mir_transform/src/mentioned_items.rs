@@ -1,18 +1,19 @@
 use rustc_middle::mir::visit::Visitor;
-use rustc_middle::mir::{self, Location, MentionedItem, MirPass};
-use rustc_middle::ty::{self, adjustment::PointerCoercion, TyCtxt};
+use rustc_middle::mir::{self, Location, MentionedItem};
+use rustc_middle::ty::adjustment::PointerCoercion;
+use rustc_middle::ty::{self, TyCtxt};
 use rustc_session::Session;
 use rustc_span::source_map::Spanned;
 
-pub struct MentionedItems;
+pub(super) struct MentionedItems;
 
 struct MentionedItemsVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     body: &'a mir::Body<'tcx>,
-    mentioned_items: &'a mut Vec<Spanned<MentionedItem<'tcx>>>,
+    mentioned_items: Vec<Spanned<MentionedItem<'tcx>>>,
 }
 
-impl<'tcx> MirPass<'tcx> for MentionedItems {
+impl<'tcx> crate::MirPass<'tcx> for MentionedItems {
     fn is_enabled(&self, _sess: &Session) -> bool {
         // If this pass is skipped the collector assume that nothing got mentioned! We could
         // potentially skip it in opt-level 0 if we are sure that opt-level will never *remove* uses
@@ -22,10 +23,9 @@ impl<'tcx> MirPass<'tcx> for MentionedItems {
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut mir::Body<'tcx>) {
-        debug_assert!(body.mentioned_items.is_empty());
-        let mut mentioned_items = Vec::new();
-        MentionedItemsVisitor { tcx, body, mentioned_items: &mut mentioned_items }.visit_body(body);
-        body.mentioned_items = mentioned_items;
+        let mut visitor = MentionedItemsVisitor { tcx, body, mentioned_items: Vec::new() };
+        visitor.visit_body(body);
+        body.set_mentioned_items(visitor.mentioned_items);
     }
 }
 
@@ -38,7 +38,7 @@ impl<'tcx> Visitor<'tcx> for MentionedItemsVisitor<'_, 'tcx> {
         self.super_terminator(terminator, location);
         let span = || self.body.source_info(location).span;
         match &terminator.kind {
-            mir::TerminatorKind::Call { func, .. } => {
+            mir::TerminatorKind::Call { func, .. } | mir::TerminatorKind::TailCall { func, .. } => {
                 let callee_ty = func.ty(self.body, self.tcx);
                 self.mentioned_items
                     .push(Spanned { node: MentionedItem::Fn(callee_ty), span: span() });
@@ -82,7 +82,9 @@ impl<'tcx> Visitor<'tcx> for MentionedItemsVisitor<'_, 'tcx> {
                     source_ty.builtin_deref(true).map(|t| t.kind()),
                     target_ty.builtin_deref(true).map(|t| t.kind()),
                 ) {
-                    (Some(ty::Array(..)), Some(ty::Str | ty::Slice(..))) => false, // &str/&[T] unsizing
+                    // &str/&[T] unsizing
+                    (Some(ty::Array(..)), Some(ty::Str | ty::Slice(..))) => false,
+
                     _ => true,
                 };
                 if may_involve_vtable {

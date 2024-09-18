@@ -304,10 +304,10 @@ impl<'tcx> Stable<'tcx> for ty::FloatTy {
 
     fn stable(&self, _: &mut Tables<'_>) -> Self::T {
         match self {
-            ty::FloatTy::F16 => unimplemented!("f16_f128"),
+            ty::FloatTy::F16 => FloatTy::F16,
             ty::FloatTy::F32 => FloatTy::F32,
             ty::FloatTy::F64 => FloatTy::F64,
-            ty::FloatTy::F128 => unimplemented!("f16_f128"),
+            ty::FloatTy::F128 => FloatTy::F128,
         }
     }
 }
@@ -352,7 +352,9 @@ impl<'tcx> Stable<'tcx> for ty::TyKind<'tcx> {
             ty::FnDef(def_id, generic_args) => {
                 TyKind::RigidTy(RigidTy::FnDef(tables.fn_def(*def_id), generic_args.stable(tables)))
             }
-            ty::FnPtr(poly_fn_sig) => TyKind::RigidTy(RigidTy::FnPtr(poly_fn_sig.stable(tables))),
+            ty::FnPtr(sig_tys, hdr) => {
+                TyKind::RigidTy(RigidTy::FnPtr(sig_tys.with(*hdr).stable(tables)))
+            }
             ty::Dynamic(existential_predicates, region, dyn_kind) => {
                 TyKind::RigidTy(RigidTy::Dynamic(
                     existential_predicates
@@ -409,13 +411,13 @@ impl<'tcx> Stable<'tcx> for ty::Pattern<'tcx> {
     }
 }
 
-pub fn mir_const_from_ty_const<'tcx>(
+pub(crate) fn mir_const_from_ty_const<'tcx>(
     tables: &mut Tables<'tcx>,
     ty_const: ty::Const<'tcx>,
     ty: Ty<'tcx>,
 ) -> stable_mir::ty::MirConst {
     let kind = match ty_const.kind() {
-        ty::Value(val) => {
+        ty::Value(ty, val) => {
             let val = match val {
                 ty::ValTree::Leaf(scalar) => ty::ValTree::Leaf(scalar),
                 ty::ValTree::Branch(branch) => {
@@ -447,7 +449,7 @@ pub fn mir_const_from_ty_const<'tcx>(
         ty::ExprCt(_) => unimplemented!(),
     };
     let stable_ty = tables.intern_ty(ty);
-    let id = tables.intern_mir_const(mir::Const::Ty(ty_const));
+    let id = tables.intern_mir_const(mir::Const::Ty(ty, ty_const));
     stable_mir::ty::MirConst::new(kind, stable_ty, id)
 }
 
@@ -456,14 +458,15 @@ impl<'tcx> Stable<'tcx> for ty::Const<'tcx> {
 
     fn stable(&self, tables: &mut Tables<'_>) -> Self::T {
         let kind = match self.kind() {
-            ty::Value(val) => {
+            ty::Value(ty, val) => {
                 let val = match val {
                     ty::ValTree::Leaf(scalar) => ty::ValTree::Leaf(scalar),
                     ty::ValTree::Branch(branch) => {
                         ty::ValTree::Branch(tables.tcx.lift(branch).unwrap())
                     }
                 };
-                let ty = tables.tcx.lift(self.ty()).unwrap();
+
+                let ty = tables.tcx.lift(ty).unwrap();
                 let const_val = tables.tcx.valtree_to_const_val((ty, val));
                 if matches!(const_val, mir::ConstValue::ZeroSized) {
                     stable_mir::ty::TyConstKind::ZSTValue(ty.stable(tables))
@@ -599,7 +602,7 @@ impl<'tcx> Stable<'tcx> for rustc_middle::ty::GenericParamDefKind {
             ty::GenericParamDefKind::Type { has_default, synthetic } => {
                 GenericParamDefKind::Type { has_default: *has_default, synthetic: *synthetic }
             }
-            ty::GenericParamDefKind::Const { has_default, is_host_effect: _ } => {
+            ty::GenericParamDefKind::Const { has_default, is_host_effect: _, synthetic: _ } => {
                 GenericParamDefKind::Const { has_default: *has_default }
             }
         }
@@ -838,22 +841,21 @@ impl<'tcx> Stable<'tcx> for ty::Instance<'tcx> {
     fn stable(&self, tables: &mut Tables<'_>) -> Self::T {
         let def = tables.instance_def(tables.tcx.lift(*self).unwrap());
         let kind = match self.def {
-            ty::InstanceDef::Item(..) => stable_mir::mir::mono::InstanceKind::Item,
-            ty::InstanceDef::Intrinsic(..) => stable_mir::mir::mono::InstanceKind::Intrinsic,
-            ty::InstanceDef::Virtual(_def_id, idx) => {
+            ty::InstanceKind::Item(..) => stable_mir::mir::mono::InstanceKind::Item,
+            ty::InstanceKind::Intrinsic(..) => stable_mir::mir::mono::InstanceKind::Intrinsic,
+            ty::InstanceKind::Virtual(_def_id, idx) => {
                 stable_mir::mir::mono::InstanceKind::Virtual { idx }
             }
-            ty::InstanceDef::VTableShim(..)
-            | ty::InstanceDef::ReifyShim(..)
-            | ty::InstanceDef::FnPtrAddrShim(..)
-            | ty::InstanceDef::ClosureOnceShim { .. }
-            | ty::InstanceDef::ConstructCoroutineInClosureShim { .. }
-            | ty::InstanceDef::CoroutineKindShim { .. }
-            | ty::InstanceDef::ThreadLocalShim(..)
-            | ty::InstanceDef::DropGlue(..)
-            | ty::InstanceDef::CloneShim(..)
-            | ty::InstanceDef::FnPtrShim(..)
-            | ty::InstanceDef::AsyncDropGlueCtorShim(..) => {
+            ty::InstanceKind::VTableShim(..)
+            | ty::InstanceKind::ReifyShim(..)
+            | ty::InstanceKind::FnPtrAddrShim(..)
+            | ty::InstanceKind::ClosureOnceShim { .. }
+            | ty::InstanceKind::ConstructCoroutineInClosureShim { .. }
+            | ty::InstanceKind::ThreadLocalShim(..)
+            | ty::InstanceKind::DropGlue(..)
+            | ty::InstanceKind::CloneShim(..)
+            | ty::InstanceKind::FnPtrShim(..)
+            | ty::InstanceKind::AsyncDropGlueCtorShim(..) => {
                 stable_mir::mir::mono::InstanceKind::Shim
             }
         };
@@ -865,10 +867,10 @@ impl<'tcx> Stable<'tcx> for ty::Variance {
     type T = stable_mir::mir::Variance;
     fn stable(&self, _: &mut Tables<'_>) -> Self::T {
         match self {
-            ty::Variance::Bivariant => stable_mir::mir::Variance::Bivariant,
-            ty::Variance::Contravariant => stable_mir::mir::Variance::Contravariant,
-            ty::Variance::Covariant => stable_mir::mir::Variance::Covariant,
-            ty::Variance::Invariant => stable_mir::mir::Variance::Invariant,
+            ty::Bivariant => stable_mir::mir::Variance::Bivariant,
+            ty::Contravariant => stable_mir::mir::Variance::Contravariant,
+            ty::Covariant => stable_mir::mir::Variance::Covariant,
+            ty::Invariant => stable_mir::mir::Variance::Invariant,
         }
     }
 }
@@ -908,7 +910,6 @@ impl<'tcx> Stable<'tcx> for rustc_target::spec::abi::Abi {
             abi::Abi::AvrInterrupt => Abi::AvrInterrupt,
             abi::Abi::AvrNonBlockingInterrupt => Abi::AvrNonBlockingInterrupt,
             abi::Abi::CCmseNonSecureCall => Abi::CCmseNonSecureCall,
-            abi::Abi::Wasm => Abi::Wasm,
             abi::Abi::System { unwind } => Abi::System { unwind },
             abi::Abi::RustIntrinsic => Abi::RustIntrinsic,
             abi::Abi::RustCall => Abi::RustCall,

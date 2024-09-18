@@ -1,13 +1,7 @@
 //! Miscellaneous type-system utilities that are too small to deserve their own modules.
 
-use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
-use crate::query::{IntoQueryParam, Providers};
-use crate::ty::layout::{FloatExt, IntegerExt};
-use crate::ty::{
-    self, Asyncness, FallibleTypeFolder, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable,
-    TypeVisitableExt, Upcast,
-};
-use crate::ty::{GenericArgKind, GenericArgsRef};
+use std::{fmt, iter};
+
 use rustc_apfloat::Float as _;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::stable_hasher::{Hash128, HashStable, StableHasher};
@@ -23,8 +17,15 @@ use rustc_span::sym;
 use rustc_target::abi::{Float, Integer, IntegerType, Size};
 use rustc_target::spec::abi::Abi;
 use smallvec::{smallvec, SmallVec};
-use std::{fmt, iter};
 use tracing::{debug, instrument, trace};
+
+use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
+use crate::query::{IntoQueryParam, Providers};
+use crate::ty::layout::{FloatExt, IntegerExt};
+use crate::ty::{
+    self, Asyncness, FallibleTypeFolder, GenericArgKind, GenericArgsRef, Ty, TyCtxt, TypeFoldable,
+    TypeFolder, TypeSuperFoldable, TypeVisitableExt, Upcast,
+};
 
 #[derive(Copy, Clone, Debug)]
 pub struct Discr<'tcx> {
@@ -78,7 +79,7 @@ impl<'tcx> Discr<'tcx> {
         let (val, oflo) = if signed {
             let min = size.signed_int_min();
             let max = size.signed_int_max();
-            let val = size.sign_extend(self.val) as i128;
+            let val = size.sign_extend(self.val);
             assert!(n < (i128::MAX as u128));
             let n = n as i128;
             let oflo = val > max - n;
@@ -170,14 +171,6 @@ impl<'tcx> TyCtxt<'tcx> {
         }
     }
 
-    /// Attempts to returns the deeply last field of nested structures, but
-    /// does not apply any normalization in its search. Returns the same type
-    /// if input `ty` is not a structure at all.
-    pub fn struct_tail_without_normalization(self, ty: Ty<'tcx>) -> Ty<'tcx> {
-        let tcx = self;
-        tcx.struct_tail_with_normalize(ty, |ty| ty, || {})
-    }
-
     /// Returns the deeply last field of nested structures, or the same type if
     /// not a structure at all. Corresponds to the only possible unsized field,
     /// and its type can be used to determine unsizing strategy.
@@ -185,13 +178,9 @@ impl<'tcx> TyCtxt<'tcx> {
     /// Should only be called if `ty` has no inference variables and does not
     /// need its lifetimes preserved (e.g. as part of codegen); otherwise
     /// normalization attempt may cause compiler bugs.
-    pub fn struct_tail_erasing_lifetimes(
-        self,
-        ty: Ty<'tcx>,
-        param_env: ty::ParamEnv<'tcx>,
-    ) -> Ty<'tcx> {
+    pub fn struct_tail_for_codegen(self, ty: Ty<'tcx>, param_env: ty::ParamEnv<'tcx>) -> Ty<'tcx> {
         let tcx = self;
-        tcx.struct_tail_with_normalize(ty, |ty| tcx.normalize_erasing_regions(param_env, ty), || {})
+        tcx.struct_tail_raw(ty, |ty| tcx.normalize_erasing_regions(param_env, ty), || {})
     }
 
     /// Returns the deeply last field of nested structures, or the same type if
@@ -199,12 +188,14 @@ impl<'tcx> TyCtxt<'tcx> {
     /// and its type can be used to determine unsizing strategy.
     ///
     /// This is parameterized over the normalization strategy (i.e. how to
-    /// handle `<T as Trait>::Assoc` and `impl Trait`); pass the identity
-    /// function to indicate no normalization should take place.
+    /// handle `<T as Trait>::Assoc` and `impl Trait`). You almost certainly do
+    /// **NOT** want to pass the identity function here, unless you know what
+    /// you're doing, or you're within normalization code itself and will handle
+    /// an unnormalized tail recursively.
     ///
-    /// See also `struct_tail_erasing_lifetimes`, which is suitable for use
+    /// See also `struct_tail_for_codegen`, which is suitable for use
     /// during codegen.
-    pub fn struct_tail_with_normalize(
+    pub fn struct_tail_raw(
         self,
         mut ty: Ty<'tcx>,
         mut normalize: impl FnMut(Ty<'tcx>) -> Ty<'tcx>,
@@ -271,20 +262,20 @@ impl<'tcx> TyCtxt<'tcx> {
     /// Same as applying `struct_tail` on `source` and `target`, but only
     /// keeps going as long as the two types are instances of the same
     /// structure definitions.
-    /// For `(Foo<Foo<T>>, Foo<dyn Trait>)`, the result will be `(Foo<T>, Trait)`,
+    /// For `(Foo<Foo<T>>, Foo<dyn Trait>)`, the result will be `(Foo<T>, dyn Trait)`,
     /// whereas struct_tail produces `T`, and `Trait`, respectively.
     ///
     /// Should only be called if the types have no inference variables and do
     /// not need their lifetimes preserved (e.g., as part of codegen); otherwise,
     /// normalization attempt may cause compiler bugs.
-    pub fn struct_lockstep_tails_erasing_lifetimes(
+    pub fn struct_lockstep_tails_for_codegen(
         self,
         source: Ty<'tcx>,
         target: Ty<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
     ) -> (Ty<'tcx>, Ty<'tcx>) {
         let tcx = self;
-        tcx.struct_lockstep_tails_with_normalize(source, target, |ty| {
+        tcx.struct_lockstep_tails_raw(source, target, |ty| {
             tcx.normalize_erasing_regions(param_env, ty)
         })
     }
@@ -295,9 +286,9 @@ impl<'tcx> TyCtxt<'tcx> {
     /// For `(Foo<Foo<T>>, Foo<dyn Trait>)`, the result will be `(Foo<T>, Trait)`,
     /// whereas struct_tail produces `T`, and `Trait`, respectively.
     ///
-    /// See also `struct_lockstep_tails_erasing_lifetimes`, which is suitable for use
+    /// See also `struct_lockstep_tails_for_codegen`, which is suitable for use
     /// during codegen.
-    pub fn struct_lockstep_tails_with_normalize(
+    pub fn struct_lockstep_tails_raw(
         self,
         source: Ty<'tcx>,
         target: Ty<'tcx>,
@@ -305,7 +296,7 @@ impl<'tcx> TyCtxt<'tcx> {
     ) -> (Ty<'tcx>, Ty<'tcx>) {
         let (mut a, mut b) = (source, target);
         loop {
-            match (&a.kind(), &b.kind()) {
+            match (a.kind(), b.kind()) {
                 (&ty::Adt(a_def, a_args), &ty::Adt(b_def, b_args))
                     if a_def == b_def && a_def.is_struct() =>
                 {
@@ -565,42 +556,6 @@ impl<'tcx> TyCtxt<'tcx> {
         Ok(())
     }
 
-    /// Checks whether each generic argument is simply a unique generic placeholder.
-    ///
-    /// This is used in the new solver, which canonicalizes params to placeholders
-    /// for better caching.
-    pub fn uses_unique_placeholders_ignoring_regions(
-        self,
-        args: GenericArgsRef<'tcx>,
-    ) -> Result<(), NotUniqueParam<'tcx>> {
-        let mut seen = GrowableBitSet::default();
-        for arg in args {
-            match arg.unpack() {
-                // Ignore regions, since we can't resolve those in a canonicalized
-                // query in the trait solver.
-                GenericArgKind::Lifetime(_) => {}
-                GenericArgKind::Type(t) => match t.kind() {
-                    ty::Placeholder(p) => {
-                        if !seen.insert(p.bound.var) {
-                            return Err(NotUniqueParam::DuplicateParam(t.into()));
-                        }
-                    }
-                    _ => return Err(NotUniqueParam::NotParam(t.into())),
-                },
-                GenericArgKind::Const(c) => match c.kind() {
-                    ty::ConstKind::Placeholder(p) => {
-                        if !seen.insert(p.bound) {
-                            return Err(NotUniqueParam::DuplicateParam(c.into()));
-                        }
-                    }
-                    _ => return Err(NotUniqueParam::NotParam(c.into())),
-                },
-            }
-        }
-
-        Ok(())
-    }
-
     /// Returns `true` if `def_id` refers to a closure, coroutine, or coroutine-closure
     /// (i.e. an async closure). These are all represented by `hir::Closure`, and all
     /// have the same `DefKind`.
@@ -616,7 +571,10 @@ impl<'tcx> TyCtxt<'tcx> {
     /// Returns `true` if `def_id` refers to a definition that does not have its own
     /// type-checking context, i.e. closure, coroutine or inline const.
     pub fn is_typeck_child(self, def_id: DefId) -> bool {
-        matches!(self.def_kind(def_id), DefKind::Closure | DefKind::InlineConst)
+        matches!(
+            self.def_kind(def_id),
+            DefKind::Closure | DefKind::InlineConst | DefKind::SyntheticCoroutineBody
+        )
     }
 
     /// Returns `true` if `def_id` refers to a trait (i.e., `trait Foo { ... }`).
@@ -904,7 +862,7 @@ impl<'tcx> TyCtxt<'tcx> {
             // If `extern_crate` is `None`, then the crate was injected (e.g., by the allocator).
             // Treat that kind of crate as "indirect", since it's an implementation detail of
             // the language.
-            || self.extern_crate(key.as_def_id()).is_some_and(|e| e.is_direct())
+            || self.extern_crate(key).is_some_and(|e| e.is_direct())
     }
 
     /// Whether the item has a host effect param. This is different from `TyCtxt::is_const`,
@@ -1119,7 +1077,7 @@ impl<'tcx> OpaqueTypeExpander<'tcx> {
 }
 
 impl<'tcx> TypeFolder<TyCtxt<'tcx>> for OpaqueTypeExpander<'tcx> {
-    fn interner(&self) -> TyCtxt<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 
@@ -1166,7 +1124,7 @@ struct WeakAliasTypeExpander<'tcx> {
 }
 
 impl<'tcx> TypeFolder<TyCtxt<'tcx>> for WeakAliasTypeExpander<'tcx> {
-    fn interner(&self) -> TyCtxt<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 
@@ -1232,7 +1190,7 @@ impl<'tcx> Ty<'tcx> {
     /// Returns the minimum and maximum values for the given numeric type (including `char`s) or
     /// returns `None` if the type is not numeric.
     pub fn numeric_min_and_max_as_bits(self, tcx: TyCtxt<'tcx>) -> Option<(u128, u128)> {
-        use rustc_apfloat::ieee::{Double, Single};
+        use rustc_apfloat::ieee::{Double, Half, Quad, Single};
         Some(match self.kind() {
             ty::Int(_) | ty::Uint(_) => {
                 let (size, signed) = self.int_size_and_signed(tcx);
@@ -1242,12 +1200,14 @@ impl<'tcx> Ty<'tcx> {
                 (min, max)
             }
             ty::Char => (0, std::char::MAX as u128),
+            ty::Float(ty::FloatTy::F16) => ((-Half::INFINITY).to_bits(), Half::INFINITY.to_bits()),
             ty::Float(ty::FloatTy::F32) => {
                 ((-Single::INFINITY).to_bits(), Single::INFINITY.to_bits())
             }
             ty::Float(ty::FloatTy::F64) => {
                 ((-Double::INFINITY).to_bits(), Double::INFINITY.to_bits())
             }
+            ty::Float(ty::FloatTy::F128) => ((-Quad::INFINITY).to_bits(), Quad::INFINITY.to_bits()),
             _ => return None,
         })
     }
@@ -1302,7 +1262,7 @@ impl<'tcx> Ty<'tcx> {
     ///
     /// Returning true means the type is known to be `Freeze`. Returning
     /// `false` means nothing -- could be `Freeze`, might not be.
-    fn is_trivially_freeze(self) -> bool {
+    pub fn is_trivially_freeze(self) -> bool {
         match self.kind() {
             ty::Int(_)
             | ty::Uint(_)
@@ -1315,7 +1275,7 @@ impl<'tcx> Ty<'tcx> {
             | ty::RawPtr(_, _)
             | ty::FnDef(..)
             | ty::Error(_)
-            | ty::FnPtr(_) => true,
+            | ty::FnPtr(..) => true,
             ty::Tuple(fields) => fields.iter().all(Self::is_trivially_freeze),
             ty::Pat(ty, _) | ty::Slice(ty) | ty::Array(ty, _) => ty.is_trivially_freeze(),
             ty::Adt(..)
@@ -1355,7 +1315,7 @@ impl<'tcx> Ty<'tcx> {
             | ty::RawPtr(_, _)
             | ty::FnDef(..)
             | ty::Error(_)
-            | ty::FnPtr(_) => true,
+            | ty::FnPtr(..) => true,
             ty::Tuple(fields) => fields.iter().all(Self::is_trivially_unpin),
             ty::Pat(ty, _) | ty::Slice(ty) | ty::Array(ty, _) => ty.is_trivially_unpin(),
             ty::Adt(..)
@@ -1394,7 +1354,7 @@ impl<'tcx> Ty<'tcx> {
             | ty::Ref(..)
             | ty::RawPtr(..)
             | ty::FnDef(..)
-            | ty::FnPtr(_)
+            | ty::FnPtr(..)
             | ty::Infer(ty::FreshIntTy(_))
             | ty::Infer(ty::FreshFloatTy(_)) => AsyncDropGlueMorphology::Noop,
 
@@ -1577,7 +1537,7 @@ impl<'tcx> Ty<'tcx> {
             ty::Pat(..) | ty::Ref(..) | ty::Array(..) | ty::Slice(_) | ty::Tuple(..) => true,
 
             // Raw pointers use bitwise comparison.
-            ty::RawPtr(_, _) | ty::FnPtr(_) => true,
+            ty::RawPtr(_, _) | ty::FnPtr(..) => true,
 
             // Floating point numbers are not `Eq`.
             ty::Float(_) => false,
@@ -1671,7 +1631,7 @@ impl<'tcx> ExplicitSelf<'tcx> {
             _ if is_self_ty(self_arg_ty) => ByValue,
             ty::Ref(region, ty, mutbl) if is_self_ty(ty) => ByReference(region, mutbl),
             ty::RawPtr(ty, mutbl) if is_self_ty(ty) => ByRawPointer(mutbl),
-            ty::Adt(def, _) if def.is_box() && is_self_ty(self_arg_ty.boxed_ty()) => ByBox,
+            _ if self_arg_ty.boxed_ty().is_some_and(is_self_ty) => ByBox,
             _ => Other,
         }
     }
@@ -1708,7 +1668,7 @@ pub fn needs_drop_components_with_async<'tcx>(
         | ty::Float(_)
         | ty::Never
         | ty::FnDef(..)
-        | ty::FnPtr(_)
+        | ty::FnPtr(..)
         | ty::Char
         | ty::RawPtr(_, _)
         | ty::Ref(..)
@@ -1775,7 +1735,7 @@ pub fn is_trivially_const_drop(ty: Ty<'_>) -> bool {
         | ty::RawPtr(_, _)
         | ty::Ref(..)
         | ty::FnDef(..)
-        | ty::FnPtr(_)
+        | ty::FnPtr(..)
         | ty::Never
         | ty::Foreign(_) => true,
 
@@ -1831,7 +1791,7 @@ where
             for t in iter {
                 new_list.push(t.try_fold_with(folder)?)
             }
-            Ok(intern(folder.interner(), &new_list))
+            Ok(intern(folder.cx(), &new_list))
         }
         Some((_, Err(err))) => {
             return Err(err);

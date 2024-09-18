@@ -1,4 +1,4 @@
-//! Command-line interface of the rustbuild build system.
+//! Command-line interface of the bootstrap build system.
 //!
 //! This module implements the command-line parsing of the build system which
 //! has various flags to configure how it's run.
@@ -143,9 +143,6 @@ pub struct Flags {
     /// Unless you know exactly what you are doing, you probably don't need this.
     pub bypass_bootstrap_lock: bool,
 
-    /// whether rebuilding llvm should be skipped, overriding `skip-rebuld` in config.toml
-    #[arg(global = true, long, value_name = "VALUE")]
-    pub llvm_skip_rebuild: Option<bool>,
     /// generate PGO profile with rustc build
     #[arg(global = true, value_hint = clap::ValueHint::FilePath, long, value_name = "PROFILE")]
     pub rust_profile_generate: Option<String>,
@@ -183,9 +180,9 @@ pub struct Flags {
 }
 
 impl Flags {
-    pub fn parse(args: &[String]) -> Self {
-        let first = String::from("x.py");
-        let it = std::iter::once(&first).chain(args.iter());
+    /// Check if `<cmd> -h -v` was passed.
+    /// If yes, print the available paths and return `true`.
+    pub fn try_parse_verbose_help(args: &[String]) -> bool {
         // We need to check for `<cmd> -h -v`, in which case we list the paths
         #[derive(Parser)]
         #[command(disable_help_flag(true))]
@@ -198,10 +195,10 @@ impl Flags {
             cmd: Kind,
         }
         if let Ok(HelpVerboseOnly { help: true, verbose: 1.., cmd: subcommand }) =
-            HelpVerboseOnly::try_parse_from(it.clone())
+            HelpVerboseOnly::try_parse_from(normalize_args(args))
         {
             println!("NOTE: updating submodules before printing available paths");
-            let config = Config::parse(&[String::from("build")]);
+            let config = Config::parse(Self::parse(&[String::from("build")]));
             let build = Build::new(config);
             let paths = Builder::get_help(&build, subcommand);
             if let Some(s) = paths {
@@ -209,11 +206,21 @@ impl Flags {
             } else {
                 panic!("No paths available for subcommand `{}`", subcommand.as_str());
             }
-            crate::exit!(0);
+            true
+        } else {
+            false
         }
-
-        Flags::parse_from(it)
     }
+
+    pub fn parse(args: &[String]) -> Self {
+        Flags::parse_from(normalize_args(args))
+    }
+}
+
+fn normalize_args(args: &[String]) -> Vec<String> {
+    let first = String::from("x.py");
+    let it = std::iter::once(first).chain(args.iter().cloned());
+    it.collect()
 }
 
 #[derive(Debug, Clone, Default, clap::Subcommand)]
@@ -347,9 +354,9 @@ pub enum Subcommand {
         /// extra arguments to be passed for the test tool being used
         /// (e.g. libtest, compiletest or rustdoc)
         test_args: Vec<String>,
-        /// extra options to pass the compiler when running tests
+        /// extra options to pass the compiler when running compiletest tests
         #[arg(long, value_name = "ARGS", allow_hyphen_values(true))]
-        rustc_args: Vec<String>,
+        compiletest_rustc_args: Vec<String>,
         #[arg(long)]
         /// do not run doc tests
         no_doc: bool,
@@ -392,9 +399,6 @@ pub enum Subcommand {
         /// extra arguments to be passed for the test tool being used
         /// (e.g. libtest, compiletest or rustdoc)
         test_args: Vec<String>,
-        /// extra options to pass the compiler when running tests
-        #[arg(long, value_name = "ARGS", allow_hyphen_values(true))]
-        rustc_args: Vec<String>,
         #[arg(long)]
         /// do not run doc tests
         no_doc: bool,
@@ -469,6 +473,11 @@ Arguments:
         #[arg(long)]
         versioned_dirs: bool,
     },
+    /// Perform profiling and benchmarking of the compiler using the
+    /// `rustc-perf-wrapper` tool.
+    ///
+    /// You need to pass arguments after `--`, e.g.`x perf -- cachegrind`.
+    Perf {},
 }
 
 impl Subcommand {
@@ -490,13 +499,14 @@ impl Subcommand {
             Subcommand::Setup { .. } => Kind::Setup,
             Subcommand::Suggest { .. } => Kind::Suggest,
             Subcommand::Vendor { .. } => Kind::Vendor,
+            Subcommand::Perf { .. } => Kind::Perf,
         }
     }
 
-    pub fn rustc_args(&self) -> Vec<&str> {
+    pub fn compiletest_rustc_args(&self) -> Vec<&str> {
         match *self {
-            Subcommand::Test { ref rustc_args, .. } | Subcommand::Miri { ref rustc_args, .. } => {
-                rustc_args.iter().flat_map(|s| s.split_whitespace()).collect()
+            Subcommand::Test { ref compiletest_rustc_args, .. } => {
+                compiletest_rustc_args.iter().flat_map(|s| s.split_whitespace()).collect()
             }
             _ => vec![],
         }

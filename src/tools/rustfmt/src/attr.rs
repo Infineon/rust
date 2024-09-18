@@ -3,6 +3,7 @@
 use rustc_ast::ast;
 use rustc_ast::HasAttrs;
 use rustc_span::{symbol::sym, Span};
+use tracing::debug;
 
 use self::doc_comment::DocCommentFormatter;
 use crate::comment::{contains_comment, rewrite_doc_comment, CommentStyle};
@@ -353,10 +354,18 @@ impl Rewrite for ast::Attribute {
 
                 // 1 = `[`
                 let shape = shape.offset_left(prefix.len() + 1)?;
-                Some(
-                    meta.rewrite(context, shape)
-                        .map_or_else(|| snippet.to_owned(), |rw| format!("{}[{}]", prefix, rw)),
-                )
+                Some(meta.rewrite(context, shape).map_or_else(
+                    || snippet.to_owned(),
+                    |rw| match &self.kind {
+                        ast::AttrKind::Normal(normal_attr) => match normal_attr.item.unsafety {
+                            // For #![feature(unsafe_attributes)]
+                            // See https://github.com/rust-lang/rust/issues/123757
+                            ast::Safety::Unsafe(_) => format!("{}[unsafe({})]", prefix, rw),
+                            _ => format!("{}[{}]", prefix, rw),
+                        },
+                        _ => format!("{}[{}]", prefix, rw),
+                    },
+                ))
             } else {
                 Some(snippet.to_owned())
             }

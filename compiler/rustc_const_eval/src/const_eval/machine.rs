@@ -1,36 +1,32 @@
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::fmt;
 use std::hash::Hash;
 use std::ops::ControlFlow;
 
 use rustc_ast::Mutability;
-use rustc_data_structures::fx::FxIndexMap;
-use rustc_data_structures::fx::IndexEntry;
-use rustc_hir::def_id::DefId;
-use rustc_hir::def_id::LocalDefId;
-use rustc_hir::LangItem;
-use rustc_middle::bug;
-use rustc_middle::mir;
+use rustc_data_structures::fx::{FxHashMap, FxIndexMap, IndexEntry};
+use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_hir::{self as hir, LangItem, CRATE_HIR_ID};
 use rustc_middle::mir::AssertMessage;
 use rustc_middle::query::TyCtxtAt;
-use rustc_middle::ty;
 use rustc_middle::ty::layout::{FnAbiOf, TyAndLayout};
-use rustc_session::lint::builtin::WRITES_THROUGH_IMMUTABLE_POINTER;
+use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::{bug, mir};
 use rustc_span::symbol::{sym, Symbol};
 use rustc_span::Span;
 use rustc_target::abi::{Align, Size};
 use rustc_target::spec::abi::Abi as CallAbi;
 use tracing::debug;
 
+use super::error::*;
 use crate::errors::{LongRunning, LongRunningWarn};
 use crate::fluent_generated as fluent;
 use crate::interpret::{
     self, compile_time_machine, err_ub, throw_exhaust, throw_inval, throw_ub_custom, throw_unsup,
-    throw_unsup_format, AllocId, AllocRange, ConstAllocation, CtfeProvenance, FnArg, FnVal, Frame,
-    GlobalAlloc, ImmTy, InterpCx, InterpResult, MPlaceTy, OpTy, Pointer, PointerArithmetic, Scalar,
+    throw_unsup_format, AllocId, AllocRange, ConstAllocation, CtfeProvenance, FnArg, Frame,
+    GlobalAlloc, ImmTy, InterpCx, InterpResult, MPlaceTy, OpTy, Pointer, PointerArithmetic,
+    RangeSet, Scalar, StackPopCleanup,
 };
-
-use super::error::*;
 
 /// When hitting this many interpreted terminators we emit a deny by default lint
 /// that notfies the user that their constant takes a long time to evaluate. If that's
@@ -43,8 +39,11 @@ const TINY_LINT_TERMINATOR_LIMIT: usize = 20;
 /// power of two of interpreted terminators.
 const PROGRESS_INDICATOR_START: usize = 4_000_000;
 
-/// Extra machine state for CTFE, and the Machine instance
-pub struct CompileTimeInterpreter<'tcx> {
+/// Extra machine state for CTFE, and the Machine instance.
+//
+// Should be public because out-of-tree rustc consumers need this
+// if they want to interact with constant values.
+pub struct CompileTimeMachine<'tcx> {
     /// The number of terminators that have been evaluated.
     ///
     /// This is used to produce lints informing the user that the compiler is not stuck.
@@ -66,6 +65,9 @@ pub struct CompileTimeInterpreter<'tcx> {
     /// storing the result in the given `AllocId`.
     /// Used to prevent reads from a static's base allocation, as that may allow for self-initialization loops.
     pub(crate) static_root_ids: Option<(AllocId, LocalDefId)>,
+
+    /// A cache of "data range" computations for unions (i.e., the offsets of non-padding bytes).
+    union_data_ranges: FxHashMap<Ty<'tcx>, RangeSet>,
 }
 
 #[derive(Copy, Clone)]
@@ -89,17 +91,18 @@ impl From<bool> for CanAccessMutGlobal {
     }
 }
 
-impl<'tcx> CompileTimeInterpreter<'tcx> {
+impl<'tcx> CompileTimeMachine<'tcx> {
     pub(crate) fn new(
         can_access_mut_global: CanAccessMutGlobal,
         check_alignment: CheckAlignment,
     ) -> Self {
-        CompileTimeInterpreter {
+        CompileTimeMachine {
             num_evaluated_steps: 0,
             stack: Vec::new(),
             can_access_mut_global,
             check_alignment,
             static_root_ids: None,
+            union_data_ranges: FxHashMap::default(),
         }
     }
 }
@@ -163,7 +166,7 @@ impl<K: Hash + Eq, V> interpret::AllocMap<K, V> for FxIndexMap<K, V> {
     }
 }
 
-pub(crate) type CompileTimeEvalContext<'tcx> = InterpCx<'tcx, CompileTimeInterpreter<'tcx>>;
+pub type CompileTimeInterpCx<'tcx> = InterpCx<'tcx, CompileTimeMachine<'tcx>>;
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum MemoryKind {
@@ -195,12 +198,13 @@ impl interpret::MayLeak for ! {
     }
 }
 
-impl<'tcx> CompileTimeEvalContext<'tcx> {
+impl<'tcx> CompileTimeInterpCx<'tcx> {
     fn location_triple_for_span(&self, span: Span) -> (Symbol, u32, u32) {
         let topmost = span.ctxt().outer_expn().expansion_cause().unwrap_or(span);
         let caller = self.tcx.sess.source_map().lookup_char_pos(topmost.lo());
 
-        use rustc_session::{config::RemapPathScopeComponents, RemapFileNameExt};
+        use rustc_session::config::RemapPathScopeComponents;
+        use rustc_session::RemapFileNameExt;
         (
             Symbol::intern(
                 &caller
@@ -229,7 +233,7 @@ impl<'tcx> CompileTimeEvalContext<'tcx> {
         let def_id = instance.def_id();
 
         if self.tcx.has_attr(def_id, sym::rustc_const_panic_str)
-            || Some(def_id) == self.tcx.lang_items().begin_panic_fn()
+            || self.tcx.is_lang_item(def_id, LangItem::BeginPanic)
         {
             let args = self.copy_fn_args(args);
             // &str or &&str
@@ -244,7 +248,7 @@ impl<'tcx> CompileTimeEvalContext<'tcx> {
             let span = self.find_closest_untracked_caller_location();
             let (file, line, col) = self.location_triple_for_span(span);
             return Err(ConstEvalErrKind::Panic { msg, file, line, col }.into());
-        } else if Some(def_id) == self.tcx.lang_items().panic_fmt() {
+        } else if self.tcx.is_lang_item(def_id, LangItem::PanicFmt) {
             // For panic_fmt, call const_panic_fmt instead.
             let const_def_id = self.tcx.require_lang_item(LangItem::ConstPanicFmt, None);
             let new_instance = ty::Instance::expect_resolve(
@@ -252,10 +256,11 @@ impl<'tcx> CompileTimeEvalContext<'tcx> {
                 ty::ParamEnv::reveal_all(),
                 const_def_id,
                 instance.args,
+                self.cur_span(),
             );
 
             return Ok(Some(new_instance));
-        } else if Some(def_id) == self.tcx.lang_items().align_offset_fn() {
+        } else if self.tcx.is_lang_item(def_id, LangItem::AlignOffset) {
             let args = self.copy_fn_args(args);
             // For align_offset, we replace the function call if the pointer has no address.
             match self.align_offset(instance, &args, dest, ret)? {
@@ -297,7 +302,7 @@ impl<'tcx> CompileTimeEvalContext<'tcx> {
             );
         }
 
-        match self.ptr_try_get_alloc_id(ptr) {
+        match self.ptr_try_get_alloc_id(ptr, 0) {
             Ok((alloc_id, offset, _extra)) => {
                 let (_size, alloc_align, _kind) = self.get_alloc_info(alloc_id);
 
@@ -308,17 +313,15 @@ impl<'tcx> CompileTimeEvalContext<'tcx> {
                     let align = ImmTy::from_uint(target_align, args[1].layout).into();
                     let fn_abi = self.fn_abi_of_instance(instance, ty::List::empty())?;
 
-                    // We replace the entire function call with a "tail call".
-                    // Note that this happens before the frame of the original function
-                    // is pushed on the stack.
-                    self.eval_fn_call(
-                        FnVal::Instance(instance),
-                        (CallAbi::Rust, fn_abi),
+                    // Push the stack frame with our own adjusted arguments.
+                    self.init_stack_frame(
+                        instance,
+                        self.load_mir(instance.def, None)?,
+                        fn_abi,
                         &[FnArg::Copy(addr), FnArg::Copy(align)],
                         /* with_caller_location = */ false,
                         dest,
-                        ret,
-                        mir::UnwindAction::Unreachable,
+                        StackPopCleanup::Goto { ret, unwind: mir::UnwindAction::Unreachable },
                     )?;
                     Ok(ControlFlow::Break(()))
                 } else {
@@ -369,7 +372,16 @@ impl<'tcx> CompileTimeEvalContext<'tcx> {
     }
 }
 
-impl<'tcx> interpret::Machine<'tcx> for CompileTimeInterpreter<'tcx> {
+impl<'tcx> CompileTimeMachine<'tcx> {
+    #[inline(always)]
+    /// Find the first stack frame that is within the current crate, if any.
+    /// Otherwise, return the crate's HirId
+    pub fn best_lint_scope(&self, tcx: TyCtxt<'tcx>) -> hir::HirId {
+        self.stack.iter().find_map(|frame| frame.lint_root(tcx)).unwrap_or(CRATE_HIR_ID)
+    }
+}
+
+impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
     compile_time_machine!(<'tcx>);
 
     type MemoryKind = MemoryKind;
@@ -388,10 +400,10 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeInterpreter<'tcx> {
 
     fn load_mir(
         ecx: &InterpCx<'tcx, Self>,
-        instance: ty::InstanceDef<'tcx>,
+        instance: ty::InstanceKind<'tcx>,
     ) -> InterpResult<'tcx, &'tcx mir::Body<'tcx>> {
         match instance {
-            ty::InstanceDef::Item(def) => Ok(ecx.tcx.mir_for_ctfe(def)),
+            ty::InstanceKind::Item(def) => Ok(ecx.tcx.mir_for_ctfe(def)),
             _ => Ok(ecx.tcx.instance_mir(instance)),
         }
     }
@@ -414,7 +426,7 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeInterpreter<'tcx> {
         };
 
         // Only check non-glue functions
-        if let ty::InstanceDef::Item(def) = instance.def {
+        if let ty::InstanceKind::Item(def) = instance.def {
             // Execution might have wandered off into other crates, so we cannot do a stability-
             // sensitive check here. But we can at least rule out functions that are not const at
             // all. That said, we have to allow calling functions inside a trait marked with
@@ -451,7 +463,7 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeInterpreter<'tcx> {
         _unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx, Option<ty::Instance<'tcx>>> {
         // Shared intrinsics.
-        if ecx.emulate_intrinsic(instance, args, dest, target)? {
+        if ecx.eval_intrinsic(instance, args, dest, target)? {
             return Ok(None);
         }
         let intrinsic_name = ecx.tcx.item_name(instance.def_id());
@@ -503,7 +515,7 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeInterpreter<'tcx> {
 
                 // If an allocation is created in an another const,
                 // we don't deallocate it.
-                let (alloc_id, _, _) = ecx.ptr_get_alloc_id(ptr)?;
+                let (alloc_id, _, _) = ecx.ptr_get_alloc_id(ptr, 0)?;
                 let is_allocated_in_another_const = matches!(
                     ecx.tcx.try_get_global_alloc(alloc_id),
                     Some(interpret::GlobalAlloc::Memory(_))
@@ -530,7 +542,7 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeInterpreter<'tcx> {
                     );
                 }
                 return Ok(Some(ty::Instance {
-                    def: ty::InstanceDef::Item(instance.def_id()),
+                    def: ty::InstanceKind::Item(instance.def_id()),
                     args: instance.args,
                 }));
             }
@@ -600,7 +612,7 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeInterpreter<'tcx> {
                 // By default, we stop after a million steps, but the user can disable this lint
                 // to be able to run until the heat death of the universe or power loss, whichever
                 // comes first.
-                let hir_id = ecx.best_lint_scope();
+                let hir_id = ecx.machine.best_lint_scope(*ecx.tcx);
                 let is_error = ecx
                     .tcx
                     .lint_level_at_node(
@@ -706,16 +718,29 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeInterpreter<'tcx> {
         _kind: mir::RetagKind,
         val: &ImmTy<'tcx, CtfeProvenance>,
     ) -> InterpResult<'tcx, ImmTy<'tcx, CtfeProvenance>> {
-        // If it's a frozen shared reference that's not already immutable, make it immutable.
+        // If it's a frozen shared reference that's not already immutable, potentially make it immutable.
         // (Do nothing on `None` provenance, that cannot store immutability anyway.)
         if let ty::Ref(_, ty, mutbl) = val.layout.ty.kind()
             && *mutbl == Mutability::Not
-            && val.to_scalar_and_meta().0.to_pointer(ecx)?.provenance.is_some_and(|p| !p.immutable())
-            // That next check is expensive, that's why we have all the guards above.
-            && ty.is_freeze(*ecx.tcx, ecx.param_env)
+            && val
+                .to_scalar_and_meta()
+                .0
+                .to_pointer(ecx)?
+                .provenance
+                .is_some_and(|p| !p.immutable())
         {
+            // That next check is expensive, that's why we have all the guards above.
+            let is_immutable = ty.is_freeze(*ecx.tcx, ecx.param_env);
             let place = ecx.ref_to_mplace(val)?;
-            let new_place = place.map_provenance(CtfeProvenance::as_immutable);
+            let new_place = if is_immutable {
+                place.map_provenance(CtfeProvenance::as_immutable)
+            } else {
+                // Even if it is not immutable, remember that it is a shared reference.
+                // This allows it to become part of the final value of the constant.
+                // (See <https://github.com/rust-lang/rust/pull/128543> for why we allow this
+                // even when there is interior mutability.)
+                place.map_provenance(CtfeProvenance::as_shared_ref)
+            };
             Ok(ImmTy::from_immediate(new_place.to_ref(ecx), val.layout))
         } else {
             Ok(val.clone())
@@ -723,8 +748,8 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeInterpreter<'tcx> {
     }
 
     fn before_memory_write(
-        tcx: TyCtxtAt<'tcx>,
-        machine: &mut Self,
+        _tcx: TyCtxtAt<'tcx>,
+        _machine: &mut Self,
         _alloc_extra: &mut Self::AllocExtra,
         (_alloc_id, immutable): (AllocId, bool),
         range: AllocRange,
@@ -735,9 +760,7 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeInterpreter<'tcx> {
         }
         // Reject writes through immutable pointers.
         if immutable {
-            super::lint(tcx, machine, WRITES_THROUGH_IMMUTABLE_POINTER, |frames| {
-                crate::errors::WriteThroughImmutablePointer { frames }
-            });
+            return Err(ConstEvalErrKind::WriteThroughImmutablePointer.into());
         }
         // Everything else is fine.
         Ok(())
@@ -759,6 +782,19 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeInterpreter<'tcx> {
             }
         }
         Ok(())
+    }
+
+    fn cached_union_data_range<'e>(
+        ecx: &'e mut InterpCx<'tcx, Self>,
+        ty: Ty<'tcx>,
+        compute_range: impl FnOnce() -> RangeSet,
+    ) -> Cow<'e, RangeSet> {
+        if ecx.tcx.sess.opts.unstable_opts.extra_const_ub_checks {
+            Cow::Borrowed(ecx.machine.union_data_ranges.entry(ty).or_insert_with(compute_range))
+        } else {
+            // Don't bother caching, we're only doing one validation at the end anyway.
+            Cow::Owned(compute_range())
+        }
     }
 }
 

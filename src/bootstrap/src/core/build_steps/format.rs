@@ -1,21 +1,24 @@
 //! Runs rustfmt on the repository.
 
-use crate::core::builder::Builder;
-use crate::utils::helpers::{output, program_out_of_date, t};
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::mpsc::SyncSender;
+use std::sync::Mutex;
+
 use build_helper::ci::CiEnv;
 use build_helper::git::get_git_modified_files;
 use ignore::WalkBuilder;
-use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc::SyncSender;
-use std::sync::Mutex;
+
+use crate::core::builder::Builder;
+use crate::utils::exec::command;
+use crate::utils::helpers::{self, program_out_of_date, t};
 
 fn rustfmt(src: &Path, rustfmt: &Path, paths: &[PathBuf], check: bool) -> impl FnMut(bool) -> bool {
     let mut cmd = Command::new(rustfmt);
     // Avoid the submodule config paths from coming into play. We only allow a single global config
     // for the workspace for now.
-    cmd.arg("--config-path").arg(&src.canonicalize().unwrap());
+    cmd.arg("--config-path").arg(src.canonicalize().unwrap());
     cmd.arg("--edition").arg("2021");
     cmd.arg("--unstable-features");
     cmd.arg("--skip-children");
@@ -53,19 +56,17 @@ fn rustfmt(src: &Path, rustfmt: &Path, paths: &[PathBuf], check: bool) -> impl F
 fn get_rustfmt_version(build: &Builder<'_>) -> Option<(String, PathBuf)> {
     let stamp_file = build.out.join("rustfmt.stamp");
 
-    let mut cmd = Command::new(match build.initial_rustfmt() {
+    let mut cmd = command(match build.initial_rustfmt() {
         Some(p) => p,
         None => return None,
     });
     cmd.arg("--version");
-    let output = match cmd.output() {
-        Ok(status) => status,
-        Err(_) => return None,
-    };
-    if !output.status.success() {
+
+    let output = cmd.allow_failure().run_capture(build);
+    if output.is_failure() {
         return None;
     }
-    Some((String::from_utf8(output.stdout).unwrap(), stamp_file))
+    Some((output.stdout(), stamp_file))
 }
 
 /// Return whether the format cache can be reused.
@@ -92,8 +93,7 @@ fn get_modified_rs_files(build: &Builder<'_>) -> Result<Option<Vec<String>>, Str
     if !verify_rustfmt_version(build) {
         return Ok(None);
     }
-
-    get_git_modified_files(&build.config.git_config(), Some(&build.config.src), &vec!["rs"])
+    get_git_modified_files(&build.config.git_config(), Some(&build.config.src), &["rs"])
 }
 
 #[derive(serde_derive::Deserialize)]
@@ -118,7 +118,9 @@ fn print_paths(verb: &str, adjective: Option<&str>, paths: &[String]) {
 
 pub fn format(build: &Builder<'_>, check: bool, all: bool, paths: &[PathBuf]) {
     if !paths.is_empty() {
-        eprintln!("fmt error: path arguments are not accepted");
+        eprintln!(
+            "fmt error: path arguments are no longer accepted; use `--all` to format everything"
+        );
         crate::exit!(1);
     };
     if build.config.dry_run() {
@@ -158,40 +160,25 @@ pub fn format(build: &Builder<'_>, check: bool, all: bool, paths: &[PathBuf]) {
             override_builder.add(&format!("!{ignore}")).expect(&ignore);
         }
     }
-    let git_available = match Command::new("git")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-    {
-        Ok(status) => status.success(),
-        Err(_) => false,
-    };
+    let git_available =
+        helpers::git(None).allow_failure().arg("--version").run_capture(build).is_success();
 
     let mut adjective = None;
     if git_available {
-        let in_working_tree = match build
-            .config
-            .git()
+        let in_working_tree = helpers::git(Some(&build.src))
+            .allow_failure()
             .arg("rev-parse")
             .arg("--is-inside-work-tree")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            Ok(status) => status.success(),
-            Err(_) => false,
-        };
+            .run_capture(build)
+            .is_success();
         if in_working_tree {
-            let untracked_paths_output = output(
-                build
-                    .config
-                    .git()
-                    .arg("status")
-                    .arg("--porcelain")
-                    .arg("-z")
-                    .arg("--untracked-files=normal"),
-            );
+            let untracked_paths_output = helpers::git(Some(&build.src))
+                .arg("status")
+                .arg("--porcelain")
+                .arg("-z")
+                .arg("--untracked-files=normal")
+                .run_capture_stdout(build)
+                .stdout();
             let untracked_paths: Vec<_> = untracked_paths_output
                 .split_terminator('\0')
                 .filter_map(
@@ -213,6 +200,11 @@ pub fn format(build: &Builder<'_>, check: bool, all: bool, paths: &[PathBuf]) {
                 adjective = Some("modified");
                 match get_modified_rs_files(build) {
                     Ok(Some(files)) => {
+                        if files.is_empty() {
+                            println!("fmt info: No modified files detected for formatting.");
+                            return;
+                        }
+
                         for file in files {
                             override_builder.add(&format!("/{file}")).expect(&file);
                         }

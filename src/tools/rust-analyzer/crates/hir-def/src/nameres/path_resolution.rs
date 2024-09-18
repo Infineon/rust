@@ -17,7 +17,7 @@ use triomphe::Arc;
 use crate::{
     db::DefDatabase,
     item_scope::{ImportOrExternCrate, BUILTIN_SCOPE},
-    item_tree::Fields,
+    item_tree::FieldsShape,
     nameres::{sub_namespace_match, BlockInfo, BuiltinShadowMode, DefMap, MacroSubNs},
     path::{ModPath, PathKind},
     per_ns::PerNs,
@@ -283,7 +283,7 @@ impl DefMap {
                     // If we have a different `DefMap` from `self` (the original `DefMap` we started
                     // with), resolve the remaining path segments in that `DefMap`.
                     let path =
-                        ModPath::from_segments(PathKind::Super(0), path.segments().iter().cloned());
+                        ModPath::from_segments(PathKind::SELF, path.segments().iter().cloned());
                     return def_map.resolve_path_fp_with_macro(
                         db,
                         mode,
@@ -333,7 +333,7 @@ impl DefMap {
                 ModuleDefId::ModuleId(module) => {
                     if module.krate != self.krate {
                         let path = ModPath::from_segments(
-                            PathKind::Super(0),
+                            PathKind::SELF,
                             path.segments()[i..].iter().cloned(),
                         );
                         tracing::debug!("resolving {:?} in other crate", path);
@@ -381,11 +381,11 @@ impl DefMap {
                     .iter()
                     .find_map(|&variant| {
                         let variant_data = &tree[variant.lookup(db).id.value];
-                        (variant_data.name == *segment).then(|| match variant_data.fields {
-                            Fields::Record(_) => {
+                        (variant_data.name == *segment).then(|| match variant_data.shape {
+                            FieldsShape::Record => {
                                 PerNs::types(variant.into(), Visibility::Public, None)
                             }
-                            Fields::Tuple(_) | Fields::Unit => PerNs::both(
+                            FieldsShape::Tuple | FieldsShape::Unit => PerNs::both(
                                 variant.into(),
                                 variant.into(),
                                 Visibility::Public,
@@ -493,7 +493,12 @@ impl DefMap {
                 )
             })
         };
-        let prelude = || self.resolve_in_prelude(db, name);
+        let prelude = || {
+            if self.block.is_some() && module == DefMap::ROOT {
+                return PerNs::none();
+            }
+            self.resolve_in_prelude(db, name)
+        };
 
         from_legacy_macro
             .or(from_scope_or_builtin)

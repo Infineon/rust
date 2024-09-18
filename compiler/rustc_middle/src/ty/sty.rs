@@ -2,14 +2,11 @@
 
 #![allow(rustc::usage_of_ty_tykind)]
 
-use crate::infer::canonical::Canonical;
-use crate::ty::InferTy::*;
-use crate::ty::{
-    self, AdtDef, BoundRegionKind, Discr, Region, Ty, TyCtxt, TypeFlags, TypeSuperVisitable,
-    TypeVisitable, TypeVisitor,
-};
-use crate::ty::{GenericArg, GenericArgs, GenericArgsRef};
-use crate::ty::{List, ParamEnv};
+use std::assert_matches::debug_assert_matches;
+use std::borrow::Cow;
+use std::iter;
+use std::ops::{ControlFlow, Range};
+
 use hir::def::{CtorKind, DefKind};
 use rustc_data_structures::captures::Captures;
 use rustc_errors::{ErrorGuaranteed, MultiSpan};
@@ -21,16 +18,18 @@ use rustc_span::symbol::{sym, Symbol};
 use rustc_span::{Span, DUMMY_SP};
 use rustc_target::abi::{FieldIdx, VariantIdx, FIRST_VARIANT};
 use rustc_target::spec::abi;
-use std::assert_matches::debug_assert_matches;
-use std::borrow::Cow;
-use std::iter;
-use std::ops::{ControlFlow, Range};
-use ty::util::{AsyncDropGlueMorphology, IntTypeExt};
-
+use rustc_type_ir::visit::TypeVisitableExt;
 use rustc_type_ir::TyKind::*;
 use rustc_type_ir::{self as ir, BoundVar, CollectAndApply, DynKind};
+use ty::util::{AsyncDropGlueMorphology, IntTypeExt};
 
 use super::GenericParamDefKind;
+use crate::infer::canonical::Canonical;
+use crate::ty::InferTy::*;
+use crate::ty::{
+    self, AdtDef, BoundRegionKind, Discr, GenericArg, GenericArgs, GenericArgsRef, List, ParamEnv,
+    Region, Ty, TyCtxt, TypeFlags, TypeSuperVisitable, TypeVisitable, TypeVisitor,
+};
 
 // Re-export and re-parameterize some `I = TyCtxt<'tcx>` types here
 #[rustc_diagnostic_item = "TyKind"]
@@ -67,6 +66,10 @@ impl<'tcx> ty::CoroutineArgs<TyCtxt<'tcx>> {
     const RETURNED: usize = 1;
     /// Coroutine has been poisoned.
     const POISONED: usize = 2;
+    /// Number of variants to reserve in coroutine state. Corresponds to
+    /// `UNRESUMED` (beginning of a coroutine) and `RETURNED`/`POISONED`
+    /// (end of a coroutine) states.
+    const RESERVED_VARIANTS: usize = 3;
 
     const UNRESUMED_NAME: &'static str = "Unresumed";
     const RETURNED_NAME: &'static str = "Returned";
@@ -115,7 +118,7 @@ impl<'tcx> ty::CoroutineArgs<TyCtxt<'tcx>> {
             Self::UNRESUMED => Cow::from(Self::UNRESUMED_NAME),
             Self::RETURNED => Cow::from(Self::RETURNED_NAME),
             Self::POISONED => Cow::from(Self::POISONED_NAME),
-            _ => Cow::from(format!("Suspend{}", v.as_usize() - 3)),
+            _ => Cow::from(format!("Suspend{}", v.as_usize() - Self::RESERVED_VARIANTS)),
         }
     }
 
@@ -339,6 +342,27 @@ impl ParamConst {
     pub fn for_def(def: &ty::GenericParamDef) -> ParamConst {
         ParamConst::new(def.index, def.name)
     }
+
+    pub fn find_ty_from_env<'tcx>(self, env: ParamEnv<'tcx>) -> Ty<'tcx> {
+        let mut candidates = env.caller_bounds().iter().filter_map(|clause| {
+            // `ConstArgHasType` are never desugared to be higher ranked.
+            match clause.kind().skip_binder() {
+                ty::ClauseKind::ConstArgHasType(param_ct, ty) => {
+                    assert!(!(param_ct, ty).has_escaping_bound_vars());
+
+                    match param_ct.kind() {
+                        ty::ConstKind::Param(param_ct) if param_ct.index == self.index => Some(ty),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        });
+
+        let ty = candidates.next().unwrap();
+        assert!(candidates.next().is_none());
+        ty
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, TyEncodable, TyDecodable)]
@@ -477,7 +501,7 @@ impl<'tcx> Ty<'tcx> {
 
     #[inline]
     pub fn new_opaque(tcx: TyCtxt<'tcx>, def_id: DefId, args: GenericArgsRef<'tcx>) -> Ty<'tcx> {
-        Ty::new_alias(tcx, ty::Opaque, AliasTy::new(tcx, def_id, args))
+        Ty::new_alias(tcx, ty::Opaque, AliasTy::new_from_args(tcx, def_id, args))
     }
 
     /// Constructs a `TyKind::Error` type with current `ErrorGuaranteed`
@@ -634,7 +658,8 @@ impl<'tcx> Ty<'tcx> {
 
     #[inline]
     pub fn new_fn_ptr(tcx: TyCtxt<'tcx>, fty: PolyFnSig<'tcx>) -> Ty<'tcx> {
-        Ty::new(tcx, FnPtr(fty))
+        let (sig_tys, hdr) = fty.split();
+        Ty::new(tcx, FnPtr(sig_tys, hdr))
     }
 
     #[inline]
@@ -645,6 +670,15 @@ impl<'tcx> Ty<'tcx> {
         repr: DynKind,
     ) -> Ty<'tcx> {
         Ty::new(tcx, Dynamic(obj, reg, repr))
+    }
+
+    #[inline]
+    pub fn new_projection_from_args(
+        tcx: TyCtxt<'tcx>,
+        item_def_id: DefId,
+        args: ty::GenericArgsRef<'tcx>,
+    ) -> Ty<'tcx> {
+        Ty::new_alias(tcx, ty::Projection, AliasTy::new_from_args(tcx, item_def_id, args))
     }
 
     #[inline]
@@ -764,12 +798,24 @@ impl<'tcx> rustc_type_ir::inherent::Ty<TyCtxt<'tcx>> for Ty<'tcx> {
         tcx.types.bool
     }
 
+    fn new_u8(tcx: TyCtxt<'tcx>) -> Self {
+        tcx.types.u8
+    }
+
     fn new_infer(tcx: TyCtxt<'tcx>, infer: ty::InferTy) -> Self {
         Ty::new_infer(tcx, infer)
     }
 
     fn new_var(tcx: TyCtxt<'tcx>, vid: ty::TyVid) -> Self {
         Ty::new_var(tcx, vid)
+    }
+
+    fn new_param(tcx: TyCtxt<'tcx>, param: ty::ParamTy) -> Self {
+        Ty::new_param(tcx, param.index, param.name)
+    }
+
+    fn new_placeholder(tcx: TyCtxt<'tcx>, placeholder: ty::PlaceholderType) -> Self {
+        Ty::new_placeholder(tcx, placeholder)
     }
 
     fn new_bound(interner: TyCtxt<'tcx>, debruijn: ty::DebruijnIndex, var: ty::BoundTy) -> Self {
@@ -788,12 +834,82 @@ impl<'tcx> rustc_type_ir::inherent::Ty<TyCtxt<'tcx>> for Ty<'tcx> {
         Ty::new_alias(interner, kind, alias_ty)
     }
 
+    fn new_error(interner: TyCtxt<'tcx>, guar: ErrorGuaranteed) -> Self {
+        Ty::new_error(interner, guar)
+    }
+
+    fn new_adt(
+        interner: TyCtxt<'tcx>,
+        adt_def: ty::AdtDef<'tcx>,
+        args: ty::GenericArgsRef<'tcx>,
+    ) -> Self {
+        Ty::new_adt(interner, adt_def, args)
+    }
+
+    fn new_foreign(interner: TyCtxt<'tcx>, def_id: DefId) -> Self {
+        Ty::new_foreign(interner, def_id)
+    }
+
+    fn new_dynamic(
+        interner: TyCtxt<'tcx>,
+        preds: &'tcx List<ty::PolyExistentialPredicate<'tcx>>,
+        region: ty::Region<'tcx>,
+        kind: ty::DynKind,
+    ) -> Self {
+        Ty::new_dynamic(interner, preds, region, kind)
+    }
+
     fn new_coroutine(
         interner: TyCtxt<'tcx>,
         def_id: DefId,
         args: ty::GenericArgsRef<'tcx>,
     ) -> Self {
         Ty::new_coroutine(interner, def_id, args)
+    }
+
+    fn new_coroutine_closure(
+        interner: TyCtxt<'tcx>,
+        def_id: DefId,
+        args: ty::GenericArgsRef<'tcx>,
+    ) -> Self {
+        Ty::new_coroutine_closure(interner, def_id, args)
+    }
+
+    fn new_closure(interner: TyCtxt<'tcx>, def_id: DefId, args: ty::GenericArgsRef<'tcx>) -> Self {
+        Ty::new_closure(interner, def_id, args)
+    }
+
+    fn new_coroutine_witness(
+        interner: TyCtxt<'tcx>,
+        def_id: DefId,
+        args: ty::GenericArgsRef<'tcx>,
+    ) -> Self {
+        Ty::new_coroutine_witness(interner, def_id, args)
+    }
+
+    fn new_ptr(interner: TyCtxt<'tcx>, ty: Self, mutbl: hir::Mutability) -> Self {
+        Ty::new_ptr(interner, ty, mutbl)
+    }
+
+    fn new_ref(
+        interner: TyCtxt<'tcx>,
+        region: ty::Region<'tcx>,
+        ty: Self,
+        mutbl: hir::Mutability,
+    ) -> Self {
+        Ty::new_ref(interner, region, ty, mutbl)
+    }
+
+    fn new_array_with_const_len(interner: TyCtxt<'tcx>, ty: Self, len: ty::Const<'tcx>) -> Self {
+        Ty::new_array_with_const_len(interner, ty, len)
+    }
+
+    fn new_slice(interner: TyCtxt<'tcx>, ty: Self) -> Self {
+        Ty::new_slice(interner, ty)
+    }
+
+    fn new_tup(interner: TyCtxt<'tcx>, tys: &[Ty<'tcx>]) -> Self {
+        Ty::new_tup(interner, tys)
     }
 
     fn new_tup_from_iter<It, T>(interner: TyCtxt<'tcx>, iter: It) -> T::Output
@@ -822,10 +938,42 @@ impl<'tcx> rustc_type_ir::inherent::Ty<TyCtxt<'tcx>> for Ty<'tcx> {
     ) -> Self {
         Ty::from_coroutine_closure_kind(interner, kind)
     }
+
+    fn new_fn_def(interner: TyCtxt<'tcx>, def_id: DefId, args: ty::GenericArgsRef<'tcx>) -> Self {
+        Ty::new_fn_def(interner, def_id, args)
+    }
+
+    fn new_fn_ptr(interner: TyCtxt<'tcx>, sig: ty::Binder<'tcx, ty::FnSig<'tcx>>) -> Self {
+        Ty::new_fn_ptr(interner, sig)
+    }
+
+    fn new_pat(interner: TyCtxt<'tcx>, ty: Self, pat: ty::Pattern<'tcx>) -> Self {
+        Ty::new_pat(interner, ty, pat)
+    }
+
+    fn new_unit(interner: TyCtxt<'tcx>) -> Self {
+        interner.types.unit
+    }
+
+    fn new_usize(interner: TyCtxt<'tcx>) -> Self {
+        interner.types.usize
+    }
+
+    fn discriminant_ty(self, interner: TyCtxt<'tcx>) -> Ty<'tcx> {
+        self.discriminant_ty(interner)
+    }
+
+    fn async_destructor_ty(self, interner: TyCtxt<'tcx>) -> Ty<'tcx> {
+        self.async_destructor_ty(interner)
+    }
 }
 
 /// Type utilities
 impl<'tcx> Ty<'tcx> {
+    // It would be nicer if this returned the value instead of a reference,
+    // like how `Predicate::kind` and `Region::kind` do. (It would result in
+    // many fewer subsequent dereferences.) But that gives a small but
+    // noticeable performance hit. See #126069 for details.
     #[inline(always)]
     pub fn kind(self) -> &'tcx TyKind<'tcx> {
         self.0.0
@@ -852,7 +1000,7 @@ impl<'tcx> Ty<'tcx> {
 
     #[inline]
     pub fn is_primitive(self) -> bool {
-        self.kind().is_primitive()
+        matches!(self.kind(), Bool | Char | Int(_) | Uint(_) | Float(_))
     }
 
     #[inline]
@@ -943,29 +1091,21 @@ impl<'tcx> Ty<'tcx> {
     }
 
     pub fn simd_size_and_type(self, tcx: TyCtxt<'tcx>) -> (u64, Ty<'tcx>) {
-        match self.kind() {
-            Adt(def, args) => {
-                assert!(def.repr().simd(), "`simd_size_and_type` called on non-SIMD type");
-                let variant = def.non_enum_variant();
-                let f0_ty = variant.fields[FieldIdx::ZERO].ty(tcx, args);
-
-                match f0_ty.kind() {
-                    // If the first field is an array, we assume it is the only field and its
-                    // elements are the SIMD components.
-                    Array(f0_elem_ty, f0_len) => {
-                        // FIXME(repr_simd): https://github.com/rust-lang/rust/pull/78863#discussion_r522784112
-                        // The way we evaluate the `N` in `[T; N]` here only works since we use
-                        // `simd_size_and_type` post-monomorphization. It will probably start to ICE
-                        // if we use it in generic code. See the `simd-array-trait` ui test.
-                        (f0_len.eval_target_usize(tcx, ParamEnv::empty()), *f0_elem_ty)
-                    }
-                    // Otherwise, the fields of this Adt are the SIMD components (and we assume they
-                    // all have the same type).
-                    _ => (variant.fields.len() as u64, f0_ty),
-                }
-            }
-            _ => bug!("`simd_size_and_type` called on invalid type"),
-        }
+        let Adt(def, args) = self.kind() else {
+            bug!("`simd_size_and_type` called on invalid type")
+        };
+        assert!(def.repr().simd(), "`simd_size_and_type` called on non-SIMD type");
+        let variant = def.non_enum_variant();
+        assert_eq!(variant.fields.len(), 1);
+        let field_ty = variant.fields[FieldIdx::ZERO].ty(tcx, args);
+        let Array(f0_elem_ty, f0_len) = field_ty.kind() else {
+            bug!("Simd type has non-array field type {field_ty:?}")
+        };
+        // FIXME(repr_simd): https://github.com/rust-lang/rust/pull/78863#discussion_r522784112
+        // The way we evaluate the `N` in `[T; N]` here only works since we use
+        // `simd_size_and_type` post-monomorphization. It will probably start to ICE
+        // if we use it in generic code. See the `simd-array-trait` ui test.
+        (f0_len.eval_target_usize(tcx, ParamEnv::empty()), *f0_elem_ty)
     }
 
     #[inline]
@@ -988,6 +1128,7 @@ impl<'tcx> Ty<'tcx> {
     }
 
     /// Tests if this is any kind of primitive pointer type (reference, raw pointer, fn pointer).
+    /// `Box` is *not* considered a pointer here!
     #[inline]
     pub fn is_any_ptr(self) -> bool {
         self.is_ref() || self.is_unsafe_ptr() || self.is_fn_ptr()
@@ -1001,7 +1142,10 @@ impl<'tcx> Ty<'tcx> {
         }
     }
 
-    /// Tests whether this is a Box using the global allocator.
+    /// Tests whether this is a Box definitely using the global allocator.
+    ///
+    /// If the allocator is still generic, the answer is `false`, but it may
+    /// later turn out that it does use the global allocator.
     #[inline]
     pub fn is_box_global(self, tcx: TyCtxt<'tcx>) -> bool {
         match self.kind() {
@@ -1019,12 +1163,17 @@ impl<'tcx> Ty<'tcx> {
         }
     }
 
-    /// Panics if called on any type other than `Box<T>`.
-    pub fn boxed_ty(self) -> Ty<'tcx> {
+    pub fn boxed_ty(self) -> Option<Ty<'tcx>> {
         match self.kind() {
-            Adt(def, args) if def.is_box() => args.type_at(0),
-            _ => bug!("`boxed_ty` is called on non-box type {:?}", self),
+            Adt(def, args) if def.is_box() => Some(args.type_at(0)),
+            _ => None,
         }
+    }
+
+    /// Panics if called on any type other than `Box<T>`.
+    pub fn expect_boxed_ty(self) -> Ty<'tcx> {
+        self.boxed_ty()
+            .unwrap_or_else(|| bug!("`expect_boxed_ty` is called on non-box type {:?}", self))
     }
 
     /// A scalar type is one that denotes an atomic datum, with no sub-components.
@@ -1039,7 +1188,7 @@ impl<'tcx> Ty<'tcx> {
                 | Float(_)
                 | Uint(_)
                 | FnDef(..)
-                | FnPtr(_)
+                | FnPtr(..)
                 | RawPtr(_, _)
                 | Infer(IntVar(_) | FloatVar(_))
         )
@@ -1172,7 +1321,7 @@ impl<'tcx> Ty<'tcx> {
     /// Some types -- notably unsafe ptrs -- can only be dereferenced explicitly.
     pub fn builtin_deref(self, explicit: bool) -> Option<Ty<'tcx>> {
         match *self.kind() {
-            Adt(def, _) if def.is_box() => Some(self.boxed_ty()),
+            _ if let Some(boxed) = self.boxed_ty() => Some(boxed),
             Ref(_, ty, _) => Some(ty),
             RawPtr(ty, _) if explicit => Some(ty),
             _ => None,
@@ -1190,7 +1339,7 @@ impl<'tcx> Ty<'tcx> {
     pub fn fn_sig(self, tcx: TyCtxt<'tcx>) -> PolyFnSig<'tcx> {
         match self.kind() {
             FnDef(def_id, args) => tcx.fn_sig(*def_id).instantiate(tcx, args),
-            FnPtr(f) => *f,
+            FnPtr(sig_tys, hdr) => sig_tys.with(*hdr),
             Error(_) => {
                 // ignore errors (#54954)
                 Binder::dummy(ty::FnSig {
@@ -1209,12 +1358,12 @@ impl<'tcx> Ty<'tcx> {
 
     #[inline]
     pub fn is_fn(self) -> bool {
-        matches!(self.kind(), FnDef(..) | FnPtr(_))
+        matches!(self.kind(), FnDef(..) | FnPtr(..))
     }
 
     #[inline]
     pub fn is_fn_ptr(self) -> bool {
-        matches!(self.kind(), FnPtr(_))
+        matches!(self.kind(), FnPtr(..))
     }
 
     #[inline]
@@ -1285,7 +1434,7 @@ impl<'tcx> Ty<'tcx> {
                 let assoc_items = tcx.associated_item_def_ids(
                     tcx.require_lang_item(hir::LangItem::DiscriminantKind, None),
                 );
-                Ty::new_projection(tcx, assoc_items[0], tcx.mk_args(&[self.into()]))
+                Ty::new_projection_from_args(tcx, assoc_items[0], tcx.mk_args(&[self.into()]))
             }
 
             ty::Pat(ty, _) => ty.discriminant_ty(tcx),
@@ -1447,7 +1596,7 @@ impl<'tcx> Ty<'tcx> {
         tcx: TyCtxt<'tcx>,
         normalize: impl FnMut(Ty<'tcx>) -> Ty<'tcx>,
     ) -> Result<Ty<'tcx>, Ty<'tcx>> {
-        let tail = tcx.struct_tail_with_normalize(self, normalize, || {});
+        let tail = tcx.struct_tail_raw(self, normalize, || {});
         match tail.kind() {
             // Sized types
             ty::Infer(ty::IntVar(_) | ty::FloatVar(_))
@@ -1456,7 +1605,7 @@ impl<'tcx> Ty<'tcx> {
             | ty::Bool
             | ty::Float(_)
             | ty::FnDef(..)
-            | ty::FnPtr(_)
+            | ty::FnPtr(..)
             | ty::RawPtr(..)
             | ty::Char
             | ty::Ref(..)
@@ -1471,10 +1620,10 @@ impl<'tcx> Ty<'tcx> {
             | ty::Foreign(..)
             // `dyn*` has metadata = ().
             | ty::Dynamic(_, _, ty::DynStar)
-            // If returned by `struct_tail_with_normalize` this is a unit struct
+            // If returned by `struct_tail_raw` this is a unit struct
             // without any fields, or not a struct, and therefore is Sized.
             | ty::Adt(..)
-            // If returned by `struct_tail_with_normalize` this is the empty tuple,
+            // If returned by `struct_tail_raw` this is the empty tuple,
             // a.k.a. unit type, which is Sized
             | ty::Tuple(..) => Ok(tcx.types.unit),
 
@@ -1511,6 +1660,34 @@ impl<'tcx> Ty<'tcx> {
             Err(tail) => bug!(
                 "`ptr_metadata_ty` failed to get metadata for type: {self:?} (tail = {tail:?})"
             ),
+        }
+    }
+
+    /// Given a pointer or reference type, returns the type of the *pointee*'s
+    /// metadata. If it can't be determined exactly (perhaps due to still
+    /// being generic) then a projection through `ptr::Pointee` will be returned.
+    ///
+    /// This is particularly useful for getting the type of the result of
+    /// [`UnOp::PtrMetadata`](crate::mir::UnOp::PtrMetadata).
+    ///
+    /// Panics if `self` is not dereferencable.
+    #[track_caller]
+    pub fn pointee_metadata_ty_or_projection(self, tcx: TyCtxt<'tcx>) -> Ty<'tcx> {
+        let Some(pointee_ty) = self.builtin_deref(true) else {
+            bug!("Type {self:?} is not a pointer or reference type")
+        };
+        if pointee_ty.is_trivially_sized(tcx) {
+            tcx.types.unit
+        } else {
+            match pointee_ty.ptr_metadata_ty_or_tail(tcx, |x| x) {
+                Ok(metadata_ty) => metadata_ty,
+                Err(tail_ty) => {
+                    let Some(metadata_def_id) = tcx.lang_items().metadata_type() else {
+                        bug!("No metadata_type lang item while looking at {self:?}")
+                    };
+                    Ty::new_projection(tcx, metadata_def_id, [tail_ty])
+                }
+            }
         }
     }
 
@@ -1620,7 +1797,7 @@ impl<'tcx> Ty<'tcx> {
             | ty::Bool
             | ty::Float(_)
             | ty::FnDef(..)
-            | ty::FnPtr(_)
+            | ty::FnPtr(..)
             | ty::RawPtr(..)
             | ty::Char
             | ty::Ref(..)
@@ -1691,9 +1868,9 @@ impl<'tcx> Ty<'tcx> {
             // Definitely absolutely not copy.
             ty::Ref(_, _, hir::Mutability::Mut) => false,
 
-            // Thin pointers & thin shared references are pure-clone-copy, but for
-            // anything with custom metadata it might be more complicated.
-            ty::Ref(_, _, hir::Mutability::Not) | ty::RawPtr(..) => false,
+            // The standard library has a blanket Copy impl for shared references and raw pointers,
+            // for all unsized types.
+            ty::Ref(_, _, hir::Mutability::Not) | ty::RawPtr(..) => true,
 
             ty::Coroutine(..) | ty::CoroutineWitness(..) => false,
 
@@ -1744,14 +1921,14 @@ impl<'tcx> Ty<'tcx> {
 
     pub fn is_c_void(self, tcx: TyCtxt<'_>) -> bool {
         match self.kind() {
-            ty::Adt(adt, _) => tcx.lang_items().get(LangItem::CVoid) == Some(adt.did()),
+            ty::Adt(adt, _) => tcx.is_lang_item(adt.did(), LangItem::CVoid),
             _ => false,
         }
     }
 
     /// Returns `true` when the outermost type cannot be further normalized,
     /// resolved, or instantiated. This includes all primitive types, but also
-    /// things like ADTs and trait objects, sice even if their arguments or
+    /// things like ADTs and trait objects, since even if their arguments or
     /// nested types may be further simplified, the outermost [`TyKind`] or
     /// type constructor remains the same.
     pub fn is_known_rigid(self) -> bool {
@@ -1770,7 +1947,7 @@ impl<'tcx> Ty<'tcx> {
             | RawPtr(_, _)
             | Ref(_, _, _)
             | FnDef(_, _)
-            | FnPtr(_)
+            | FnPtr(..)
             | Dynamic(_, _, _)
             | Closure(_, _)
             | CoroutineClosure(_, _)
@@ -1784,56 +1961,23 @@ impl<'tcx> Ty<'tcx> {
 }
 
 impl<'tcx> rustc_type_ir::inherent::Tys<TyCtxt<'tcx>> for &'tcx ty::List<Ty<'tcx>> {
-    fn split_inputs_and_output(self) -> (&'tcx [Ty<'tcx>], Ty<'tcx>) {
-        let (output, inputs) = self.split_last().unwrap();
-        (inputs, *output)
+    fn inputs(self) -> &'tcx [Ty<'tcx>] {
+        self.split_last().unwrap().1
     }
-}
 
-/// Extra information about why we ended up with a particular variance.
-/// This is only used to add more information to error messages, and
-/// has no effect on soundness. While choosing the 'wrong' `VarianceDiagInfo`
-/// may lead to confusing notes in error messages, it will never cause
-/// a miscompilation or unsoundness.
-///
-/// When in doubt, use `VarianceDiagInfo::default()`
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub enum VarianceDiagInfo<'tcx> {
-    /// No additional information - this is the default.
-    /// We will not add any additional information to error messages.
-    #[default]
-    None,
-    /// We switched our variance because a generic argument occurs inside
-    /// the invariant generic argument of another type.
-    Invariant {
-        /// The generic type containing the generic parameter
-        /// that changes the variance (e.g. `*mut T`, `MyStruct<T>`)
-        ty: Ty<'tcx>,
-        /// The index of the generic parameter being used
-        /// (e.g. `0` for `*mut T`, `1` for `MyStruct<'CovariantParam, 'InvariantParam>`)
-        param_index: u32,
-    },
-}
-
-impl<'tcx> VarianceDiagInfo<'tcx> {
-    /// Mirrors `Variance::xform` - used to 'combine' the existing
-    /// and new `VarianceDiagInfo`s when our variance changes.
-    pub fn xform(self, other: VarianceDiagInfo<'tcx>) -> VarianceDiagInfo<'tcx> {
-        // For now, just use the first `VarianceDiagInfo::Invariant` that we see
-        match self {
-            VarianceDiagInfo::None => other,
-            VarianceDiagInfo::Invariant { .. } => self,
-        }
+    fn output(self) -> Ty<'tcx> {
+        *self.split_last().unwrap().0
     }
 }
 
 // Some types are used a lot. Make sure they don't unintentionally get bigger.
 #[cfg(target_pointer_width = "64")]
 mod size_asserts {
-    use super::*;
     use rustc_data_structures::static_assert_size;
+
+    use super::*;
     // tidy-alphabetical-start
     static_assert_size!(ty::RegionKind<'_>, 24);
-    static_assert_size!(ty::TyKind<'_>, 32);
+    static_assert_size!(ty::TyKind<'_>, 24);
     // tidy-alphabetical-end
 }

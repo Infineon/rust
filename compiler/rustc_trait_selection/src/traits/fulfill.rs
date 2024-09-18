@@ -1,32 +1,30 @@
-use crate::infer::{InferCtxt, TyOrConstInferVar};
-use crate::traits::error_reporting::TypeErrCtxtExt;
-use crate::traits::normalize::normalize_with_depth_to;
+use std::marker::PhantomData;
+
 use rustc_data_structures::captures::Captures;
-use rustc_data_structures::obligation_forest::ProcessResult;
-use rustc_data_structures::obligation_forest::{Error, ForestObligation, Outcome};
-use rustc_data_structures::obligation_forest::{ObligationForest, ObligationProcessor};
+use rustc_data_structures::obligation_forest::{
+    Error, ForestObligation, ObligationForest, ObligationProcessor, Outcome, ProcessResult,
+};
 use rustc_infer::infer::DefineOpaqueTypes;
-use rustc_infer::traits::{FromSolverError, ProjectionCacheKey};
-use rustc_infer::traits::{PolyTraitObligation, SelectionError, TraitEngine};
+use rustc_infer::traits::{
+    FromSolverError, PolyTraitObligation, ProjectionCacheKey, SelectionError, TraitEngine,
+};
 use rustc_middle::bug;
 use rustc_middle::mir::interpret::ErrorHandled;
 use rustc_middle::ty::abstract_const::NotConstEvaluatable;
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
-use rustc_middle::ty::GenericArgsRef;
-use rustc_middle::ty::{self, Binder, Const, TypeVisitableExt};
-use std::marker::PhantomData;
+use rustc_middle::ty::{self, Binder, Const, GenericArgsRef, TypeVisitableExt};
+use tracing::{debug, debug_span, instrument};
 
 use super::project::{self, ProjectAndUnifyResult};
 use super::select::SelectionContext;
-use super::wf;
-use super::EvaluationResult;
-use super::PredicateObligation;
-use super::Unimplemented;
-use super::{const_evaluatable, ScrubbedTraitError};
-use super::{FulfillmentError, FulfillmentErrorCode};
-
-use crate::traits::project::PolyProjectionObligation;
-use crate::traits::project::ProjectionCacheKeyExt as _;
+use super::{
+    const_evaluatable, wf, EvaluationResult, FulfillmentError, FulfillmentErrorCode,
+    PredicateObligation, ScrubbedTraitError, Unimplemented,
+};
+use crate::error_reporting::InferCtxtErrorExt;
+use crate::infer::{InferCtxt, TyOrConstInferVar};
+use crate::traits::normalize::normalize_with_depth_to;
+use crate::traits::project::{PolyProjectionObligation, ProjectionCacheKeyExt as _};
 use crate::traits::query::evaluate_obligation::InferCtxtExt;
 
 impl<'tcx> ForestObligation for PendingPredicateObligation<'tcx> {
@@ -439,37 +437,50 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                 // This is because this is not ever a useful obligation to report
                 // as the cause of an overflow.
                 ty::PredicateKind::Clause(ty::ClauseKind::ConstArgHasType(ct, ty)) => {
-                    // FIXME(BoxyUwU): Really we should not be calling `ct.ty()` for any variant
-                    // other than `ConstKind::Value`. Unfortunately this would require looking in the
-                    // env for any `ConstArgHasType` assumptions for parameters and placeholders. I
-                    // don't really want to implement this in the old solver so I haven't.
-                    //
-                    // We do still stall on infer vars though as otherwise a goal like:
-                    // `ConstArgHasType(?x: usize, usize)` can succeed even though it might later
-                    // get unified with some const that is not of type `usize`.
-                    let ct = self.selcx.infcx.shallow_resolve_const(ct);
-                    match ct.kind() {
-                        ty::ConstKind::Infer(ty::InferConst::Var(vid)) => {
+                    let ct = infcx.shallow_resolve_const(ct);
+                    let ct_ty = match ct.kind() {
+                        ty::ConstKind::Infer(var) => {
+                            let var = match var {
+                                ty::InferConst::Var(vid) => TyOrConstInferVar::Const(vid),
+                                ty::InferConst::EffectVar(vid) => TyOrConstInferVar::Effect(vid),
+                                ty::InferConst::Fresh(_) => {
+                                    bug!("encountered fresh const in fulfill")
+                                }
+                            };
                             pending_obligation.stalled_on.clear();
-                            pending_obligation.stalled_on.extend([TyOrConstInferVar::Const(vid)]);
-                            ProcessResult::Unchanged
+                            pending_obligation.stalled_on.extend([var]);
+                            return ProcessResult::Unchanged;
                         }
                         ty::ConstKind::Error(_) => return ProcessResult::Changed(vec![]),
-                        _ => {
-                            match self.selcx.infcx.at(&obligation.cause, obligation.param_env).eq(
-                                // Only really excercised by generic_const_exprs
-                                DefineOpaqueTypes::Yes,
-                                ct.ty(),
-                                ty,
-                            ) {
-                                Ok(inf_ok) => {
-                                    ProcessResult::Changed(mk_pending(inf_ok.into_obligations()))
-                                }
-                                Err(_) => ProcessResult::Error(FulfillmentErrorCode::Select(
-                                    SelectionError::Unimplemented,
-                                )),
-                            }
+                        ty::ConstKind::Value(ty, _) => ty,
+                        ty::ConstKind::Unevaluated(uv) => {
+                            infcx.tcx.type_of(uv.def).instantiate(infcx.tcx, uv.args)
                         }
+                        // FIXME(generic_const_exprs): we should construct an alias like
+                        // `<lhs_ty as Add<rhs_ty>>::Output` when this is an `Expr` representing
+                        // `lhs + rhs`.
+                        ty::ConstKind::Expr(_) => {
+                            return ProcessResult::Changed(mk_pending(vec![]));
+                        }
+                        ty::ConstKind::Placeholder(_) => {
+                            bug!("placeholder const {:?} in old solver", ct)
+                        }
+                        ty::ConstKind::Bound(_, _) => bug!("escaping bound vars in {:?}", ct),
+                        ty::ConstKind::Param(param_ct) => {
+                            param_ct.find_ty_from_env(obligation.param_env)
+                        }
+                    };
+
+                    match infcx.at(&obligation.cause, obligation.param_env).eq(
+                        // Only really exercised by generic_const_exprs
+                        DefineOpaqueTypes::Yes,
+                        ct_ty,
+                        ty,
+                    ) {
+                        Ok(inf_ok) => ProcessResult::Changed(mk_pending(inf_ok.into_obligations())),
+                        Err(_) => ProcessResult::Error(FulfillmentErrorCode::Select(
+                            SelectionError::ConstArgHasWrongType { ct, ct_ty, expected_ty: ty },
+                        )),
                     }
                 }
 
@@ -633,7 +644,6 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                             match self.selcx.infcx.try_const_eval_resolve(
                                 obligation.param_env,
                                 unevaluated,
-                                c.ty(),
                                 obligation.cause.span,
                             ) {
                                 Ok(val) => Ok(val),

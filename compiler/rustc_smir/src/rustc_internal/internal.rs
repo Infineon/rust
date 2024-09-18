@@ -4,7 +4,7 @@
 //! due to incomplete stable coverage.
 
 // Prefer importing stable_mir over internal rustc constructs to make this file more readable.
-use crate::rustc_smir::Tables;
+
 use rustc_middle::ty::{self as rustc_ty, Const as InternalConst, Ty as InternalTy, TyCtxt};
 use rustc_span::Symbol;
 use stable_mir::abi::Layout;
@@ -20,6 +20,7 @@ use stable_mir::ty::{
 use stable_mir::{CrateItem, CrateNum, DefId};
 
 use super::RustcInternal;
+use crate::rustc_smir::Tables;
 
 impl RustcInternal for CrateItem {
     type T<'tcx> = rustc_span::def_id::DefId;
@@ -130,7 +131,10 @@ impl RustcInternal for RigidTy {
             RigidTy::FnDef(def, args) => {
                 rustc_ty::TyKind::FnDef(def.0.internal(tables, tcx), args.internal(tables, tcx))
             }
-            RigidTy::FnPtr(sig) => rustc_ty::TyKind::FnPtr(sig.internal(tables, tcx)),
+            RigidTy::FnPtr(sig) => {
+                let (sig_tys, hdr) = sig.internal(tables, tcx).split();
+                rustc_ty::TyKind::FnPtr(sig_tys, hdr)
+            }
             RigidTy::Closure(def, args) => {
                 rustc_ty::TyKind::Closure(def.0.internal(tables, tcx), args.internal(tables, tcx))
             }
@@ -188,8 +192,10 @@ impl RustcInternal for FloatTy {
 
     fn internal<'tcx>(&self, _tables: &mut Tables<'_>, _tcx: TyCtxt<'tcx>) -> Self::T<'tcx> {
         match self {
+            FloatTy::F16 => rustc_ty::FloatTy::F16,
             FloatTy::F32 => rustc_ty::FloatTy::F32,
             FloatTy::F64 => rustc_ty::FloatTy::F64,
+            FloatTy::F128 => rustc_ty::FloatTy::F128,
         }
     }
 }
@@ -251,7 +257,9 @@ impl RustcInternal for MirConst {
     fn internal<'tcx>(&self, tables: &mut Tables<'_>, tcx: TyCtxt<'tcx>) -> Self::T<'tcx> {
         let constant = tables.mir_consts[self.id];
         match constant {
-            rustc_middle::mir::Const::Ty(ty) => rustc_middle::mir::Const::Ty(tcx.lift(ty).unwrap()),
+            rustc_middle::mir::Const::Ty(ty, ct) => {
+                rustc_middle::mir::Const::Ty(tcx.lift(ty).unwrap(), tcx.lift(ct).unwrap())
+            }
             rustc_middle::mir::Const::Unevaluated(uneval, ty) => {
                 rustc_middle::mir::Const::Unevaluated(
                     tcx.lift(uneval).unwrap(),
@@ -406,7 +414,7 @@ impl RustcInternal for TraitRef {
     type T<'tcx> = rustc_ty::TraitRef<'tcx>;
 
     fn internal<'tcx>(&self, tables: &mut Tables<'_>, tcx: TyCtxt<'tcx>) -> Self::T<'tcx> {
-        rustc_ty::TraitRef::new(
+        rustc_ty::TraitRef::new_from_args(
             tcx,
             self.def_id.0.internal(tables, tcx),
             self.args().internal(tables, tcx),
@@ -462,7 +470,6 @@ impl RustcInternal for Abi {
             Abi::AvrInterrupt => rustc_target::spec::abi::Abi::AvrInterrupt,
             Abi::AvrNonBlockingInterrupt => rustc_target::spec::abi::Abi::AvrNonBlockingInterrupt,
             Abi::CCmseNonSecureCall => rustc_target::spec::abi::Abi::CCmseNonSecureCall,
-            Abi::Wasm => rustc_target::spec::abi::Abi::Wasm,
             Abi::System { unwind } => rustc_target::spec::abi::Abi::System { unwind },
             Abi::RustIntrinsic => rustc_target::spec::abi::Abi::RustIntrinsic,
             Abi::RustCall => rustc_target::spec::abi::Abi::RustCall,

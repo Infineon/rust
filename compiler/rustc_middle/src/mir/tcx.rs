@@ -3,9 +3,10 @@
  * building is complete.
  */
 
-use crate::mir::*;
 use rustc_hir as hir;
 use tracing::{debug, instrument};
+
+use crate::mir::*;
 
 #[derive(Copy, Clone, Debug, TypeFoldable, TypeVisitable)]
 pub struct PlaceTy<'tcx> {
@@ -169,7 +170,7 @@ impl<'tcx> Rvalue<'tcx> {
                 let place_ty = place.ty(local_decls, tcx).ty;
                 Ty::new_ref(tcx, reg, place_ty, bk.to_mutbl_lossy())
             }
-            Rvalue::AddressOf(mutability, ref place) => {
+            Rvalue::RawPtr(mutability, ref place) => {
                 let place_ty = place.ty(local_decls, tcx).ty;
                 Ty::new_ptr(tcx, place_ty, mutability)
             }
@@ -289,19 +290,7 @@ impl<'tcx> UnOp {
     pub fn ty(&self, tcx: TyCtxt<'tcx>, arg_ty: Ty<'tcx>) -> Ty<'tcx> {
         match self {
             UnOp::Not | UnOp::Neg => arg_ty,
-            UnOp::PtrMetadata => {
-                let pointee_ty = arg_ty
-                    .builtin_deref(true)
-                    .unwrap_or_else(|| bug!("PtrMetadata of non-dereferenceable ty {arg_ty:?}"));
-                if pointee_ty.is_trivially_sized(tcx) {
-                    tcx.types.unit
-                } else {
-                    let Some(metadata_def_id) = tcx.lang_items().metadata_type() else {
-                        bug!("No metadata_type lang item while looking at {arg_ty:?}")
-                    };
-                    Ty::new_projection(tcx, metadata_def_id, [pointee_ty])
-                }
-            }
+            UnOp::PtrMetadata => arg_ty.pointee_metadata_ty_or_projection(tcx),
         }
     }
 }

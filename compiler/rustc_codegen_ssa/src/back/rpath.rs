@@ -1,24 +1,19 @@
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
 use pathdiff::diff_paths;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_fs_util::try_canonicalize;
-use std::ffi::OsString;
-use std::path::{Path, PathBuf};
 use tracing::debug;
 
 pub struct RPathConfig<'a> {
     pub libs: &'a [&'a Path],
     pub out_filename: PathBuf,
     pub is_like_osx: bool,
-    pub has_rpath: bool,
     pub linker_is_gnu: bool,
 }
 
 pub fn get_rpath_flags(config: &RPathConfig<'_>) -> Vec<OsString> {
-    // No rpath on windows
-    if !config.has_rpath {
-        return Vec::new();
-    }
-
     debug!("preparing the RPATH!");
 
     let rpaths = get_rpaths(config);

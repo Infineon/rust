@@ -1,5 +1,4 @@
-use rustc_middle::ty::TyCtxt;
-use rustc_middle::ty::Visibility;
+use rustc_middle::ty::{TyCtxt, Visibility};
 
 use crate::clean;
 use crate::clean::Item;
@@ -24,7 +23,7 @@ struct AliasedNonLocalStripper<'tcx> {
 
 impl<'tcx> DocFolder for AliasedNonLocalStripper<'tcx> {
     fn fold_item(&mut self, i: Item) -> Option<Item> {
-        Some(match *i.kind {
+        Some(match i.kind {
             clean::TypeAliasItem(..) => {
                 let mut stripper = NonLocalStripper { tcx: self.tcx };
                 // don't call `fold_item` as that could strip the type-alias it-self

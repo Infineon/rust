@@ -1,28 +1,34 @@
+use std::fmt;
+
+use rustc_ast as ast;
+use rustc_ast::util::parser::ExprPrecedence;
+use rustc_ast::{
+    Attribute, FloatTy, InlineAsmOptions, InlineAsmTemplatePiece, IntTy, Label, LitKind,
+    TraitObjectSyntax, UintTy,
+};
+pub use rustc_ast::{
+    BinOp, BinOpKind, BindingMode, BorrowKind, ByRef, CaptureBy, ImplPolarity, IsAuto, Movability,
+    Mutability, UnOp,
+};
+use rustc_data_structures::fingerprint::Fingerprint;
+use rustc_data_structures::sorted_map::SortedMap;
+use rustc_index::IndexVec;
+use rustc_macros::{Decodable, Encodable, HashStable_Generic};
+use rustc_span::def_id::LocalDefId;
+use rustc_span::hygiene::MacroKind;
+use rustc_span::source_map::Spanned;
+use rustc_span::symbol::{kw, sym, Ident, Symbol};
+use rustc_span::{BytePos, ErrorGuaranteed, Span, DUMMY_SP};
+use rustc_target::asm::InlineAsmRegOrRegClass;
+use rustc_target::spec::abi::Abi;
+use smallvec::SmallVec;
+use tracing::debug;
+
 use crate::def::{CtorKind, DefKind, Res};
 use crate::def_id::{DefId, LocalDefIdMap};
 pub(crate) use crate::hir_id::{HirId, ItemLocalId, ItemLocalMap, OwnerId};
 use crate::intravisit::FnKind;
 use crate::LangItem;
-use rustc_ast as ast;
-use rustc_ast::util::parser::ExprPrecedence;
-use rustc_ast::{Attribute, FloatTy, IntTy, Label, LitKind, TraitObjectSyntax, UintTy};
-pub use rustc_ast::{BinOp, BinOpKind, BindingMode, BorrowKind, ByRef, CaptureBy};
-pub use rustc_ast::{ImplPolarity, IsAuto, Movability, Mutability, UnOp};
-use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
-use rustc_data_structures::fingerprint::Fingerprint;
-use rustc_data_structures::sorted_map::SortedMap;
-use rustc_index::IndexVec;
-use rustc_macros::{Decodable, Encodable, HashStable_Generic};
-use rustc_span::hygiene::MacroKind;
-use rustc_span::source_map::Spanned;
-use rustc_span::symbol::{kw, sym, Ident, Symbol};
-use rustc_span::ErrorGuaranteed;
-use rustc_span::{def_id::LocalDefId, BytePos, Span, DUMMY_SP};
-use rustc_target::asm::InlineAsmRegOrRegClass;
-use rustc_target::spec::abi::Abi;
-use smallvec::SmallVec;
-use std::fmt;
-use tracing::debug;
 
 #[derive(Debug, Copy, Clone, HashStable_Generic)]
 pub struct Lifetime {
@@ -162,6 +168,19 @@ impl Lifetime {
             (LifetimeSuggestionPosition::Normal, self.ident.span)
         }
     }
+
+    pub fn suggestion(&self, new_lifetime: &str) -> (Span, String) {
+        debug_assert!(new_lifetime.starts_with('\''));
+        let (pos, span) = self.suggestion_position();
+        let code = match pos {
+            LifetimeSuggestionPosition::Normal => format!("{new_lifetime}"),
+            LifetimeSuggestionPosition::Ampersand => format!("{new_lifetime} "),
+            LifetimeSuggestionPosition::ElidedPath => format!("<{new_lifetime}>"),
+            LifetimeSuggestionPosition::ElidedPathArgument => format!("{new_lifetime}, "),
+            LifetimeSuggestionPosition::ObjectDefault => format!("+ {new_lifetime}"),
+        };
+        (span, code)
+    }
 }
 
 /// A `Path` is essentially Rust's notion of a name; for instance,
@@ -228,11 +247,51 @@ impl<'hir> PathSegment<'hir> {
     }
 }
 
+/// A constant that enters the type system, used for arguments to const generics (e.g. array lengths).
+///
+/// These are distinct from [`AnonConst`] as anon consts in the type system are not allowed
+/// to use any generic parameters, therefore we must represent `N` differently. Additionally
+/// future designs for supporting generic parameters in const arguments will likely not use
+/// an anon const based design.
+///
+/// So, `ConstArg` (specifically, [`ConstArgKind`]) distinguishes between const args
+/// that are [just paths](ConstArgKind::Path) (currently just bare const params)
+/// versus const args that are literals or have arbitrary computations (e.g., `{ 1 + 3 }`).
 #[derive(Clone, Copy, Debug, HashStable_Generic)]
 pub struct ConstArg<'hir> {
-    pub value: &'hir AnonConst,
+    #[stable_hasher(ignore)]
+    pub hir_id: HirId,
+    pub kind: ConstArgKind<'hir>,
     /// Indicates whether this comes from a `~const` desugaring.
     pub is_desugared_from_effects: bool,
+}
+
+impl<'hir> ConstArg<'hir> {
+    pub fn anon_const_hir_id(&self) -> Option<HirId> {
+        match self.kind {
+            ConstArgKind::Anon(ac) => Some(ac.hir_id),
+            _ => None,
+        }
+    }
+
+    pub fn span(&self) -> Span {
+        match self.kind {
+            ConstArgKind::Path(path) => path.span(),
+            ConstArgKind::Anon(anon) => anon.span,
+        }
+    }
+}
+
+/// See [`ConstArg`].
+#[derive(Clone, Copy, Debug, HashStable_Generic)]
+pub enum ConstArgKind<'hir> {
+    /// **Note:** Currently this is only used for bare const params
+    /// (`N` where `fn foo<const N: usize>(...)`),
+    /// not paths to any const (`N` where `const N: usize = ...`).
+    ///
+    /// However, in the future, we'll be using it for all of those.
+    Path(QPath<'hir>),
+    Anon(&'hir AnonConst),
 }
 
 #[derive(Clone, Copy, Debug, HashStable_Generic)]
@@ -251,7 +310,7 @@ impl InferArg {
 pub enum GenericArg<'hir> {
     Lifetime(&'hir Lifetime),
     Type(&'hir Ty<'hir>),
-    Const(ConstArg<'hir>),
+    Const(&'hir ConstArg<'hir>),
     Infer(InferArg),
 }
 
@@ -260,7 +319,7 @@ impl GenericArg<'_> {
         match self {
             GenericArg::Lifetime(l) => l.ident.span,
             GenericArg::Type(t) => t.span,
-            GenericArg::Const(c) => c.value.span,
+            GenericArg::Const(c) => c.span(),
             GenericArg::Infer(i) => i.span,
         }
     }
@@ -269,7 +328,7 @@ impl GenericArg<'_> {
         match self {
             GenericArg::Lifetime(l) => l.hir_id,
             GenericArg::Type(t) => t.hir_id,
-            GenericArg::Const(c) => c.value.hir_id,
+            GenericArg::Const(c) => c.hir_id,
             GenericArg::Infer(i) => i.hir_id,
         }
     }
@@ -463,6 +522,7 @@ pub enum TraitBoundModifier {
 pub enum GenericBound<'hir> {
     Trait(PolyTraitRef<'hir>, TraitBoundModifier),
     Outlives(&'hir Lifetime),
+    Use(&'hir [PreciseCapturingArg<'hir>], Span),
 }
 
 impl GenericBound<'_> {
@@ -477,6 +537,7 @@ impl GenericBound<'_> {
         match self {
             GenericBound::Trait(t, ..) => t.span,
             GenericBound::Outlives(l) => l.ident.span,
+            GenericBound::Use(_, span) => *span,
         }
     }
 }
@@ -522,8 +583,9 @@ pub enum GenericParamKind<'hir> {
     Const {
         ty: &'hir Ty<'hir>,
         /// Optional default value for the const generic param
-        default: Option<&'hir AnonConst>,
+        default: Option<&'hir ConstArg<'hir>>,
         is_host_effect: bool,
+        synthetic: bool,
     },
 }
 
@@ -720,7 +782,7 @@ impl<'hir> Generics<'hir> {
         )
     }
 
-    fn span_for_predicate_removal(&self, pos: usize) -> Span {
+    pub fn span_for_predicate_removal(&self, pos: usize) -> Span {
         let predicate = &self.predicates[pos];
         let span = predicate.span();
 
@@ -763,15 +825,21 @@ impl<'hir> Generics<'hir> {
             return self.span_for_predicate_removal(predicate_pos);
         }
 
-        let span = bounds[bound_pos].span();
-        if bound_pos == 0 {
-            // where T: ?Sized + Bar, Foo: Bar,
-            //          ^^^^^^^^^
-            span.to(bounds[1].span().shrink_to_lo())
+        let bound_span = bounds[bound_pos].span();
+        if bound_pos < bounds.len() - 1 {
+            // If there's another bound after the current bound
+            // include the following '+' e.g.:
+            //
+            //  `T: Foo + CurrentBound + Bar`
+            //            ^^^^^^^^^^^^^^^
+            bound_span.to(bounds[bound_pos + 1].span().shrink_to_lo())
         } else {
-            // where T: Bar + ?Sized, Foo: Bar,
-            //             ^^^^^^^^^
-            bounds[bound_pos - 1].span().shrink_to_hi().to(span)
+            // If the current bound is the last bound
+            // include the preceding '+' E.g.:
+            //
+            //  `T: Foo + Bar + CurrentBound`
+            //               ^^^^^^^^^^^^^^^
+            bound_span.with_lo(bounds[bound_pos - 1].span().hi())
         }
     }
 }
@@ -907,9 +975,6 @@ pub struct OwnerNodes<'tcx> {
     pub nodes: IndexVec<ItemLocalId, ParentedNode<'tcx>>,
     /// Content of local bodies.
     pub bodies: SortedMap<ItemLocalId, &'tcx Body<'tcx>>,
-    /// Whether the body contains inline constants that are created for the query system during typeck
-    /// of the body.
-    pub has_inline_consts: bool,
 }
 
 impl<'tcx> OwnerNodes<'tcx> {
@@ -1041,6 +1106,7 @@ pub struct Block<'hir> {
     pub hir_id: HirId,
     /// Distinguishes between `unsafe { ... }` and `{ ... }`.
     pub rules: BlockCheckMode,
+    /// The span includes the curly braces `{` and `}` around the block.
     pub span: Span,
     /// If true, then there may exist `break 'a` values that aim to
     /// break out of this block early.
@@ -1342,7 +1408,7 @@ pub struct LetExpr<'hir> {
     pub pat: &'hir Pat<'hir>,
     pub ty: Option<&'hir Ty<'hir>>,
     pub init: &'hir Expr<'hir>,
-    /// `Recovered::Yes` when this let expressions is not in a syntanctically valid location.
+    /// `Recovered::Yes` when this let expressions is not in a syntactically valid location.
     /// Used to prevent building MIR in such situations.
     pub recovered: ast::Recovered,
 }
@@ -1597,13 +1663,13 @@ pub type Lit = Spanned<LitKind>;
 #[derive(Copy, Clone, Debug, HashStable_Generic)]
 pub enum ArrayLen<'hir> {
     Infer(InferArg),
-    Body(&'hir AnonConst),
+    Body(&'hir ConstArg<'hir>),
 }
 
 impl ArrayLen<'_> {
     pub fn hir_id(&self) -> HirId {
         match self {
-            ArrayLen::Infer(InferArg { hir_id, .. }) | ArrayLen::Body(AnonConst { hir_id, .. }) => {
+            ArrayLen::Infer(InferArg { hir_id, .. }) | ArrayLen::Body(ConstArg { hir_id, .. }) => {
                 *hir_id
             }
         }
@@ -1626,7 +1692,22 @@ pub struct AnonConst {
     pub span: Span,
 }
 
+/// An inline constant expression `const { something }`.
+#[derive(Copy, Clone, Debug, HashStable_Generic)]
+pub struct ConstBlock {
+    pub hir_id: HirId,
+    pub def_id: LocalDefId,
+    pub body: BodyId,
+}
+
 /// An expression.
+///
+/// For more details, see the [rust lang reference].
+/// Note that the reference does not document nightly-only features.
+/// There may be also slight differences in the names and representation of AST nodes between
+/// the compiler and the reference.
+///
+/// [rust lang reference]: https://doc.rust-lang.org/reference/expressions.html
 #[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Expr<'hir> {
     pub hir_id: HirId,
@@ -1912,7 +1993,7 @@ pub fn is_range_literal(expr: &Expr<'_>) -> bool {
 #[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum ExprKind<'hir> {
     /// Allow anonymous constants from an inline `const` block
-    ConstBlock(&'hir Expr<'hir>),
+    ConstBlock(ConstBlock),
     /// An array (e.g., `[a, b, c, d]`).
     Array(&'hir [Expr<'hir>]),
     /// A function call.
@@ -2345,7 +2426,9 @@ impl ImplItemId {
     }
 }
 
-/// Represents anything within an `impl` block.
+/// Represents an associated item within an impl block.
+///
+/// Refer to [`Impl`] for an impl block declaration.
 #[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct ImplItem<'hir> {
     pub ident: Ident,
@@ -2396,7 +2479,7 @@ pub enum ImplItemKind<'hir> {
 /// * the `A: Bound` in `Trait<A: Bound>`
 /// * the `RetTy` in `Trait(ArgTy, ArgTy) -> RetTy`
 /// * the `C = { Ct }` in `Trait<C = { Ct }>` (feature `associated_const_equality`)
-/// * the `f(): Bound` in `Trait<f(): Bound>` (feature `return_type_notation`)
+/// * the `f(..): Bound` in `Trait<f(..): Bound>` (feature `return_type_notation`)
 #[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct AssocItemConstraint<'hir> {
     pub hir_id: HirId,
@@ -2416,7 +2499,7 @@ impl<'hir> AssocItemConstraint<'hir> {
     }
 
     /// Obtain the const on the RHS of an assoc const equality constraint if applicable.
-    pub fn ct(self) -> Option<&'hir AnonConst> {
+    pub fn ct(self) -> Option<&'hir ConstArg<'hir>> {
         match self.kind {
             AssocItemConstraintKind::Equality { term: Term::Const(ct) } => Some(ct),
             _ => None,
@@ -2427,7 +2510,7 @@ impl<'hir> AssocItemConstraint<'hir> {
 #[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum Term<'hir> {
     Ty(&'hir Ty<'hir>),
-    Const(&'hir AnonConst),
+    Const(&'hir ConstArg<'hir>),
 }
 
 impl<'hir> From<&'hir Ty<'hir>> for Term<'hir> {
@@ -2436,8 +2519,8 @@ impl<'hir> From<&'hir Ty<'hir>> for Term<'hir> {
     }
 }
 
-impl<'hir> From<&'hir AnonConst> for Term<'hir> {
-    fn from(c: &'hir AnonConst) -> Self {
+impl<'hir> From<&'hir ConstArg<'hir>> for Term<'hir> {
+    fn from(c: &'hir ConstArg<'hir>) -> Self {
         Term::Const(c)
     }
 }
@@ -2454,6 +2537,15 @@ pub enum AssocItemConstraintKind<'hir> {
     Equality { term: Term<'hir> },
     /// A bound on an associated type (e.g., `AssocTy: Bound` in `Trait<AssocTy: Bound>`).
     Bound { bounds: &'hir [GenericBound<'hir>] },
+}
+
+impl<'hir> AssocItemConstraintKind<'hir> {
+    pub fn descr(&self) -> &'static str {
+        match self {
+            AssocItemConstraintKind::Equality { .. } => "binding",
+            AssocItemConstraintKind::Bound { .. } => "constraint",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, HashStable_Generic)]
@@ -2665,8 +2757,6 @@ pub struct OpaqueTy<'hir> {
     /// originating from a trait method. This makes it so that the opaque is
     /// lowered as an associated type.
     pub in_trait: bool,
-    /// List of arguments captured via `impl use<'a, P, ...> Trait` syntax.
-    pub precise_capturing_args: Option<(&'hir [PreciseCapturingArg<'hir>], Span)>,
 }
 
 #[derive(Debug, Clone, Copy, HashStable_Generic)]
@@ -2683,13 +2773,19 @@ impl PreciseCapturingArg<'_> {
             PreciseCapturingArg::Param(param) => param.hir_id,
         }
     }
+
+    pub fn name(self) -> Symbol {
+        match self {
+            PreciseCapturingArg::Lifetime(lt) => lt.ident.name,
+            PreciseCapturingArg::Param(param) => param.ident.name,
+        }
+    }
 }
 
 /// We need to have a [`Node`] for the [`HirId`] that we attach the type/const param
 /// resolution to. Lifetimes don't have this problem, and for them, it's actually
 /// kind of detrimental to use a custom node type versus just using [`Lifetime`],
 /// since resolve_bound_vars operates on `Lifetime`s.
-// FIXME(precise_capturing): Investigate storing this as a path instead?
 #[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct PreciseCapturingNonLifetimeArg {
     pub hir_id: HirId,
@@ -2754,7 +2850,11 @@ pub enum TyKind<'hir> {
     OpaqueDef(ItemId, &'hir [GenericArg<'hir>], bool),
     /// A trait object type `Bound1 + Bound2 + Bound3`
     /// where `Bound` is a trait or a lifetime.
-    TraitObject(&'hir [PolyTraitRef<'hir>], &'hir Lifetime, TraitObjectSyntax),
+    TraitObject(
+        &'hir [(PolyTraitRef<'hir>, TraitBoundModifier)],
+        &'hir Lifetime,
+        TraitObjectSyntax,
+    ),
     /// Unused for now.
     Typeof(&'hir AnonConst),
     /// `TyKind::Infer` means the type should be inferred instead of it having been
@@ -2827,6 +2927,7 @@ impl<'hir> InlineAsmOperand<'hir> {
 
 #[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct InlineAsm<'hir> {
+    pub asm_macro: ast::AsmMacro,
     pub template: &'hir [InlineAsmTemplatePiece],
     pub template_strs: &'hir [(Symbol, Option<Symbol>, Span)],
     pub operands: &'hir [(InlineAsmOperand<'hir>, Span)],
@@ -2862,6 +2963,17 @@ pub struct FnDecl<'hir> {
     pub implicit_self: ImplicitSelfKind,
     /// Is lifetime elision allowed.
     pub lifetime_elision_allowed: bool,
+}
+
+impl<'hir> FnDecl<'hir> {
+    pub fn opt_delegation_sig_id(&self) -> Option<DefId> {
+        if let FnRetTy::Return(ty) = self.output
+            && let TyKind::InferDelegation(sig_id, _) = ty.kind
+        {
+            return Some(sig_id);
+        }
+        None
+    }
 }
 
 /// Represents what type of implicit self a function has, if any.
@@ -3139,6 +3251,13 @@ impl ItemId {
 /// An item
 ///
 /// The name might be a dummy name in case of anonymous items
+///
+/// For more details, see the [rust lang reference].
+/// Note that the reference does not document nightly-only features.
+/// There may be also slight differences in the names and representation of AST nodes between
+/// the compiler and the reference.
+///
+/// [rust lang reference]: https://doc.rust-lang.org/reference/items.html
 #[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Item<'hir> {
     pub ident: Ident,
@@ -3179,10 +3298,10 @@ impl<'hir> Item<'hir> {
             ItemKind::Static(ty, mutbl, body), (ty, *mutbl, *body);
 
         expect_const, (&'hir Ty<'hir>, &'hir Generics<'hir>, BodyId),
-            ItemKind::Const(ty, gen, body), (ty, gen, *body);
+            ItemKind::Const(ty, generics, body), (ty, generics, *body);
 
         expect_fn, (&FnSig<'hir>, &'hir Generics<'hir>, BodyId),
-            ItemKind::Fn(sig, gen, body), (sig, gen, *body);
+            ItemKind::Fn(sig, generics, body), (sig, generics, *body);
 
         expect_macro, (&ast::MacroDef, MacroKind), ItemKind::Macro(def, mk), (def, *mk);
 
@@ -3194,25 +3313,25 @@ impl<'hir> Item<'hir> {
         expect_global_asm, &'hir InlineAsm<'hir>, ItemKind::GlobalAsm(asm), asm;
 
         expect_ty_alias, (&'hir Ty<'hir>, &'hir Generics<'hir>),
-            ItemKind::TyAlias(ty, gen), (ty, gen);
+            ItemKind::TyAlias(ty, generics), (ty, generics);
 
         expect_opaque_ty, &OpaqueTy<'hir>, ItemKind::OpaqueTy(ty), ty;
 
-        expect_enum, (&EnumDef<'hir>, &'hir Generics<'hir>), ItemKind::Enum(def, gen), (def, gen);
+        expect_enum, (&EnumDef<'hir>, &'hir Generics<'hir>), ItemKind::Enum(def, generics), (def, generics);
 
         expect_struct, (&VariantData<'hir>, &'hir Generics<'hir>),
-            ItemKind::Struct(data, gen), (data, gen);
+            ItemKind::Struct(data, generics), (data, generics);
 
         expect_union, (&VariantData<'hir>, &'hir Generics<'hir>),
-            ItemKind::Union(data, gen), (data, gen);
+            ItemKind::Union(data, generics), (data, generics);
 
         expect_trait,
             (IsAuto, Safety, &'hir Generics<'hir>, GenericBounds<'hir>, &'hir [TraitItemRef]),
-            ItemKind::Trait(is_auto, safety, gen, bounds, items),
-            (*is_auto, *safety, gen, bounds, items);
+            ItemKind::Trait(is_auto, safety, generics, bounds, items),
+            (*is_auto, *safety, generics, bounds, items);
 
         expect_trait_alias, (&'hir Generics<'hir>, GenericBounds<'hir>),
-            ItemKind::TraitAlias(gen, bounds), (gen, bounds);
+            ItemKind::TraitAlias(generics, bounds), (generics, bounds);
 
         expect_impl, &'hir Impl<'hir>, ItemKind::Impl(imp), imp;
     }
@@ -3327,8 +3446,13 @@ pub enum ItemKind<'hir> {
     Impl(&'hir Impl<'hir>),
 }
 
+/// Represents an impl block declaration.
+///
+/// E.g., `impl $Type { .. }` or `impl $Trait for $Type { .. }`
+/// Refer to [`ImplItem`] for an associated item within an impl block.
 #[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Impl<'hir> {
+    pub constness: Constness,
     pub safety: Safety,
     pub polarity: ImplPolarity,
     pub defaultness: Defaultness,
@@ -3475,9 +3599,9 @@ impl ForeignItem<'_> {
 #[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum ForeignItemKind<'hir> {
     /// A foreign function.
-    Fn(&'hir FnDecl<'hir>, &'hir [Ident], &'hir Generics<'hir>),
+    Fn(FnSig<'hir>, &'hir [Ident], &'hir Generics<'hir>),
     /// A foreign static item (`static ext: u8`).
-    Static(&'hir Ty<'hir>, Mutability),
+    Static(&'hir Ty<'hir>, Mutability, Safety),
     /// A foreign type.
     Type,
 }
@@ -3534,7 +3658,10 @@ impl<'hir> OwnerNode<'hir> {
         match self {
             OwnerNode::TraitItem(TraitItem { kind: TraitItemKind::Fn(fn_sig, _), .. })
             | OwnerNode::ImplItem(ImplItem { kind: ImplItemKind::Fn(fn_sig, _), .. })
-            | OwnerNode::Item(Item { kind: ItemKind::Fn(fn_sig, _, _), .. }) => Some(fn_sig),
+            | OwnerNode::Item(Item { kind: ItemKind::Fn(fn_sig, _, _), .. })
+            | OwnerNode::ForeignItem(ForeignItem {
+                kind: ForeignItemKind::Fn(fn_sig, _, _), ..
+            }) => Some(fn_sig),
             _ => None,
         }
     }
@@ -3543,11 +3670,10 @@ impl<'hir> OwnerNode<'hir> {
         match self {
             OwnerNode::TraitItem(TraitItem { kind: TraitItemKind::Fn(fn_sig, _), .. })
             | OwnerNode::ImplItem(ImplItem { kind: ImplItemKind::Fn(fn_sig, _), .. })
-            | OwnerNode::Item(Item { kind: ItemKind::Fn(fn_sig, _, _), .. }) => Some(fn_sig.decl),
-            OwnerNode::ForeignItem(ForeignItem {
-                kind: ForeignItemKind::Fn(fn_decl, _, _),
-                ..
-            }) => Some(fn_decl),
+            | OwnerNode::Item(Item { kind: ItemKind::Fn(fn_sig, _, _), .. })
+            | OwnerNode::ForeignItem(ForeignItem {
+                kind: ForeignItemKind::Fn(fn_sig, _, _), ..
+            }) => Some(fn_sig.decl),
             _ => None,
         }
     }
@@ -3587,6 +3713,11 @@ impl<'hir> OwnerNode<'hir> {
             OwnerNode::Crate(..) => crate::CRATE_HIR_ID.owner,
             OwnerNode::Synthetic => unreachable!(),
         }
+    }
+
+    /// Check if node is an impl block.
+    pub fn is_impl_block(&self) -> bool {
+        matches!(self, OwnerNode::Item(Item { kind: ItemKind::Impl(_), .. }))
     }
 
     expect_methods_self! {
@@ -3644,6 +3775,8 @@ pub enum Node<'hir> {
     Variant(&'hir Variant<'hir>),
     Field(&'hir FieldDef<'hir>),
     AnonConst(&'hir AnonConst),
+    ConstBlock(&'hir ConstBlock),
+    ConstArg(&'hir ConstArg<'hir>),
     Expr(&'hir Expr<'hir>),
     ExprField(&'hir ExprField<'hir>),
     Stmt(&'hir Stmt<'hir>),
@@ -3704,6 +3837,8 @@ impl<'hir> Node<'hir> {
             Node::PreciseCapturingNonLifetimeArg(a) => Some(a.ident),
             Node::Param(..)
             | Node::AnonConst(..)
+            | Node::ConstBlock(..)
+            | Node::ConstArg(..)
             | Node::Expr(..)
             | Node::Stmt(..)
             | Node::Block(..)
@@ -3726,10 +3861,27 @@ impl<'hir> Node<'hir> {
         match self {
             Node::TraitItem(TraitItem { kind: TraitItemKind::Fn(fn_sig, _), .. })
             | Node::ImplItem(ImplItem { kind: ImplItemKind::Fn(fn_sig, _), .. })
-            | Node::Item(Item { kind: ItemKind::Fn(fn_sig, _, _), .. }) => Some(fn_sig.decl),
-            Node::Expr(Expr { kind: ExprKind::Closure(Closure { fn_decl, .. }), .. })
-            | Node::ForeignItem(ForeignItem { kind: ForeignItemKind::Fn(fn_decl, _, _), .. }) => {
+            | Node::Item(Item { kind: ItemKind::Fn(fn_sig, _, _), .. })
+            | Node::ForeignItem(ForeignItem { kind: ForeignItemKind::Fn(fn_sig, _, _), .. }) => {
+                Some(fn_sig.decl)
+            }
+            Node::Expr(Expr { kind: ExprKind::Closure(Closure { fn_decl, .. }), .. }) => {
                 Some(fn_decl)
+            }
+            _ => None,
+        }
+    }
+
+    /// Get a `hir::Impl` if the node is an impl block for the given `trait_def_id`.
+    pub fn impl_block_of_trait(self, trait_def_id: DefId) -> Option<&'hir Impl<'hir>> {
+        match self {
+            Node::Item(Item { kind: ItemKind::Impl(impl_block), .. })
+                if impl_block
+                    .of_trait
+                    .and_then(|trait_ref| trait_ref.trait_def_id())
+                    .is_some_and(|trait_id| trait_id == trait_def_id) =>
+            {
+                Some(impl_block)
             }
             _ => None,
         }
@@ -3739,7 +3891,10 @@ impl<'hir> Node<'hir> {
         match self {
             Node::TraitItem(TraitItem { kind: TraitItemKind::Fn(fn_sig, _), .. })
             | Node::ImplItem(ImplItem { kind: ImplItemKind::Fn(fn_sig, _), .. })
-            | Node::Item(Item { kind: ItemKind::Fn(fn_sig, _, _), .. }) => Some(fn_sig),
+            | Node::Item(Item { kind: ItemKind::Fn(fn_sig, _, _), .. })
+            | Node::ForeignItem(ForeignItem { kind: ForeignItemKind::Fn(fn_sig, _, _), .. }) => {
+                Some(fn_sig)
+            }
             _ => None,
         }
     }
@@ -3801,6 +3956,7 @@ impl<'hir> Node<'hir> {
             }
 
             Node::AnonConst(constant) => Some((constant.def_id, constant.body)),
+            Node::ConstBlock(constant) => Some((constant.def_id, constant.body)),
 
             _ => None,
         }
@@ -3869,6 +4025,7 @@ impl<'hir> Node<'hir> {
         expect_variant,       &'hir Variant<'hir>,      Node::Variant(n),      n;
         expect_field,         &'hir FieldDef<'hir>,     Node::Field(n),        n;
         expect_anon_const,    &'hir AnonConst,          Node::AnonConst(n),    n;
+        expect_inline_const,  &'hir ConstBlock,         Node::ConstBlock(n),   n;
         expect_expr,          &'hir Expr<'hir>,         Node::Expr(n),         n;
         expect_expr_field,    &'hir ExprField<'hir>,    Node::ExprField(n),    n;
         expect_stmt,          &'hir Stmt<'hir>,         Node::Stmt(n),         n;
@@ -3893,17 +4050,18 @@ impl<'hir> Node<'hir> {
 // Some nodes are used a lot. Make sure they don't unintentionally get bigger.
 #[cfg(target_pointer_width = "64")]
 mod size_asserts {
-    use super::*;
     use rustc_data_structures::static_assert_size;
+
+    use super::*;
     // tidy-alphabetical-start
     static_assert_size!(Block<'_>, 48);
     static_assert_size!(Body<'_>, 24);
     static_assert_size!(Expr<'_>, 64);
     static_assert_size!(ExprKind<'_>, 48);
     static_assert_size!(FnDecl<'_>, 40);
-    static_assert_size!(ForeignItem<'_>, 72);
-    static_assert_size!(ForeignItemKind<'_>, 40);
-    static_assert_size!(GenericArg<'_>, 24);
+    static_assert_size!(ForeignItem<'_>, 88);
+    static_assert_size!(ForeignItemKind<'_>, 56);
+    static_assert_size!(GenericArg<'_>, 16);
     static_assert_size!(GenericBound<'_>, 48);
     static_assert_size!(Generics<'_>, 56);
     static_assert_size!(Impl<'_>, 80);

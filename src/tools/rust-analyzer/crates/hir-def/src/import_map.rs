@@ -8,7 +8,9 @@ use hir_expand::name::Name;
 use itertools::Itertools;
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
+use span::Edition;
 use stdx::{format_to, TupleExt};
+use syntax::ToSmolStr;
 use triomphe::Arc;
 
 use crate::{
@@ -65,7 +67,12 @@ impl ImportMap {
         for (k, v) in self.item_to_info_map.iter() {
             format_to!(out, "{:?} ({:?}) -> ", k, v.1);
             for v in &v.0 {
-                format_to!(out, "{}:{:?}, ", v.name.display(db.upcast()), v.container);
+                format_to!(
+                    out,
+                    "{}:{:?}, ",
+                    v.name.display(db.upcast(), Edition::CURRENT),
+                    v.container
+                );
             }
             format_to!(out, "\n");
         }
@@ -73,7 +80,7 @@ impl ImportMap {
     }
 
     pub(crate) fn import_map_query(db: &dyn DefDatabase, krate: CrateId) -> Arc<Self> {
-        let _p = tracing::span!(tracing::Level::INFO, "import_map_query").entered();
+        let _p = tracing::info_span!("import_map_query").entered();
 
         let map = Self::collect_import_map(db, krate);
 
@@ -81,9 +88,9 @@ impl ImportMap {
             .iter()
             // We've only collected items, whose name cannot be tuple field so unwrapping is fine.
             .flat_map(|(&item, (info, _))| {
-                info.iter()
-                    .enumerate()
-                    .map(move |(idx, info)| (item, info.name.to_smol_str(), idx as u32))
+                info.iter().enumerate().map(move |(idx, info)| {
+                    (item, info.name.unescaped().display(db.upcast()).to_smolstr(), idx as u32)
+                })
             })
             .collect();
         importables.sort_by(|(_, l_info, _), (_, r_info, _)| {
@@ -124,7 +131,7 @@ impl ImportMap {
     }
 
     fn collect_import_map(db: &dyn DefDatabase, krate: CrateId) -> ImportMapIndex {
-        let _p = tracing::span!(tracing::Level::INFO, "collect_import_map").entered();
+        let _p = tracing::info_span!("collect_import_map").entered();
 
         let def_map = db.crate_def_map(krate);
         let mut map = FxIndexMap::default();
@@ -214,7 +221,7 @@ impl ImportMap {
         is_type_in_ns: bool,
         trait_import_info: &ImportInfo,
     ) {
-        let _p = tracing::span!(tracing::Level::INFO, "collect_trait_assoc_items").entered();
+        let _p = tracing::info_span!("collect_trait_assoc_items").entered();
         for &(ref assoc_item_name, item) in &db.trait_data(tr).items {
             let module_def_id = match item {
                 AssocItemId::FunctionId(f) => ModuleDefId::from(f),
@@ -396,7 +403,7 @@ pub fn search_dependencies(
     krate: CrateId,
     query: &Query,
 ) -> FxHashSet<ItemInNs> {
-    let _p = tracing::span!(tracing::Level::INFO, "search_dependencies", ?query).entered();
+    let _p = tracing::info_span!("search_dependencies", ?query).entered();
 
     let graph = db.crate_graph();
 
@@ -412,7 +419,7 @@ pub fn search_dependencies(
             for map in &import_maps {
                 op = op.add(map.fst.search(&automaton));
             }
-            search_maps(&import_maps, op.union(), query)
+            search_maps(db, &import_maps, op.union(), query)
         }
         SearchMode::Fuzzy => {
             let automaton = fst::automaton::Subsequence::new(&query.lowercased);
@@ -420,7 +427,7 @@ pub fn search_dependencies(
             for map in &import_maps {
                 op = op.add(map.fst.search(&automaton));
             }
-            search_maps(&import_maps, op.union(), query)
+            search_maps(db, &import_maps, op.union(), query)
         }
         SearchMode::Prefix => {
             let automaton = fst::automaton::Str::new(&query.lowercased).starts_with();
@@ -428,12 +435,13 @@ pub fn search_dependencies(
             for map in &import_maps {
                 op = op.add(map.fst.search(&automaton));
             }
-            search_maps(&import_maps, op.union(), query)
+            search_maps(db, &import_maps, op.union(), query)
         }
     }
 }
 
 fn search_maps(
+    db: &dyn DefDatabase,
     import_maps: &[Arc<ImportMap>],
     mut stream: fst::map::Union<'_>,
     query: &Query,
@@ -459,7 +467,7 @@ fn search_maps(
                     query.search_mode.check(
                         &query.query,
                         query.case_sensitive,
-                        &info.name.to_smol_str(),
+                        &info.name.unescaped().display(db.upcast()).to_smolstr(),
                     )
                 });
             res.extend(iter.map(TupleExt::head));
@@ -575,7 +583,7 @@ mod tests {
         Some(format!(
             "{}::{}",
             render_path(db, &trait_info[0]),
-            assoc_item_name.display(db.upcast())
+            assoc_item_name.display(db.upcast(), Edition::CURRENT)
         ))
     }
 
@@ -614,7 +622,7 @@ mod tests {
             module = parent;
         }
 
-        segments.iter().rev().map(|it| it.display(db.upcast())).join("::")
+        segments.iter().rev().map(|it| it.display(db.upcast(), Edition::CURRENT)).join("::")
     }
 
     #[test]

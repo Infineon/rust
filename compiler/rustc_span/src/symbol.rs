@@ -2,6 +2,9 @@
 //! allows bidirectional lookup; i.e., given a value, one can easily find the
 //! type, and vice versa.
 
+use std::hash::{Hash, Hasher};
+use std::{fmt, str};
+
 use rustc_arena::DroplessArena;
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_data_structures::stable_hasher::{
@@ -10,10 +13,6 @@ use rustc_data_structures::stable_hasher::{
 use rustc_data_structures::sync::Lock;
 use rustc_macros::{symbols, Decodable, Encodable, HashStable_Generic};
 
-use std::fmt;
-use std::hash::{Hash, Hasher};
-use std::str;
-
 use crate::{with_session_globals, Edition, Span, DUMMY_SP};
 
 #[cfg(test)]
@@ -21,7 +20,8 @@ mod tests;
 
 // The proc macro code for this is in `compiler/rustc_macros/src/symbols.rs`.
 symbols! {
-    // If you modify this list, adjust `is_special` and `is_used_keyword`/`is_unused_keyword`.
+    // If you modify this list, adjust `is_special`, `is_used_keyword`/`is_unused_keyword`
+    // and `AllKeywords`.
     // But this should rarely be necessary if the keywords are kept in alphabetic order.
     Keywords {
         // Special reserved identifiers used internally for elided lifetimes,
@@ -103,6 +103,7 @@ symbols! {
         MacroRules:         "macro_rules",
         Raw:                "raw",
         Reuse:              "reuse",
+        Safe:               "safe",
         Union:              "union",
         Yeet:               "yeet",
     }
@@ -166,14 +167,17 @@ symbols! {
         Break,
         C,
         CStr,
+        C_dash_unwind: "C-unwind",
         CallOnceFuture,
         CallRefFuture,
         Capture,
         Center,
         Cleanup,
         Clone,
+        CoerceUnsized,
         Command,
         ConstParamTy,
+        ConstParamTy_,
         Context,
         Continue,
         Copy,
@@ -187,9 +191,18 @@ symbols! {
         DiagMessage,
         Diagnostic,
         DirBuilder,
+        DispatchFromDyn,
         Display,
         DoubleEndedIterator,
         Duration,
+        EffectsCompat,
+        EffectsIntersection,
+        EffectsIntersectionOutput,
+        EffectsMaybe,
+        EffectsNoRuntime,
+        EffectsRuntime,
+        EffectsTyCompat,
+        Effects__,
         Encodable,
         Encoder,
         Enumerate,
@@ -264,6 +277,7 @@ symbols! {
         Path,
         PathBuf,
         Pending,
+        PinCoerceUnsized,
         Pointer,
         Poll,
         ProcMacro,
@@ -297,8 +311,10 @@ symbols! {
         Saturating,
         Send,
         SeqCst,
+        Sized,
         SliceIndex,
         SliceIter,
+        SmartPointer,
         Some,
         SpanCtxt,
         String,
@@ -321,6 +337,8 @@ symbols! {
         TyCtxt,
         TyKind,
         Unknown,
+        Unsize,
+        UnsizedConstParamTy,
         Upvars,
         Vec,
         VecDeque,
@@ -339,6 +357,7 @@ symbols! {
         _task_context,
         a32,
         aarch64_target_feature,
+        aarch64_unstable_target_feature,
         aarch64_ver_target_feature,
         abi,
         abi_amdgpu_kernel,
@@ -389,6 +408,7 @@ symbols! {
         append_const_msg,
         arbitrary_enum_discriminant,
         arbitrary_self_types,
+        arbitrary_self_types_pointers,
         args,
         arith_offset,
         arm,
@@ -455,6 +475,7 @@ symbols! {
         attr,
         attr_literals,
         attributes,
+        audit_that,
         augmented_assignments,
         auto_traits,
         automatically_derived,
@@ -517,6 +538,7 @@ symbols! {
         cfg_attr_multi,
         cfg_doctest,
         cfg_eval,
+        cfg_fmt_debug,
         cfg_hide,
         cfg_overflow_checks,
         cfg_panic,
@@ -540,6 +562,7 @@ symbols! {
         clobber_abi,
         clone,
         clone_closures,
+        clone_fn,
         clone_from,
         closure,
         closure_lifetime_binder,
@@ -634,7 +657,9 @@ symbols! {
         coroutine,
         coroutine_clone,
         coroutine_resume,
+        coroutine_return,
         coroutine_state,
+        coroutine_yield,
         coroutines,
         cosf128,
         cosf16,
@@ -652,6 +677,7 @@ symbols! {
         crate_visibility_modifier,
         crt_dash_static: "crt-static",
         csky_target_feature,
+        cstr_type,
         cstring_type,
         ctlz,
         ctlz_nonzero,
@@ -703,6 +729,7 @@ symbols! {
         derive,
         derive_const,
         derive_default_enum,
+        derive_smart_pointer,
         destruct,
         destructuring_assignment,
         diagnostic,
@@ -758,6 +785,7 @@ symbols! {
         enable,
         encode,
         end,
+        entry_nops,
         enumerate_method,
         env,
         env_CFG_RELEASE: env!("CFG_RELEASE"),
@@ -869,6 +897,7 @@ symbols! {
         fmaf32,
         fmaf64,
         fmt,
+        fmt_debug,
         fmul_algebraic,
         fmul_fast,
         fn_align,
@@ -912,6 +941,7 @@ symbols! {
         fs_create_dir,
         fsub_algebraic,
         fsub_fast,
+        full,
         fundamental,
         fused_iterator,
         future,
@@ -986,6 +1016,7 @@ symbols! {
         ident,
         if_let,
         if_let_guard,
+        if_let_rescope,
         if_while_or_patterns,
         ignore,
         impl_header_lifetime_elision,
@@ -1115,6 +1146,7 @@ symbols! {
         macro_lifetime_matcher,
         macro_literal_matcher,
         macro_metavar_expr,
+        macro_metavar_expr_concat,
         macro_reexport,
         macro_use,
         macro_vis_matcher,
@@ -1171,6 +1203,7 @@ symbols! {
         mir_assume,
         mir_basic_block,
         mir_call,
+        mir_cast_ptr_to_ptr,
         mir_cast_transmute,
         mir_checked,
         mir_copy_for_deref,
@@ -1193,6 +1226,7 @@ symbols! {
         mir_static_mut,
         mir_storage_dead,
         mir_storage_live,
+        mir_tail_call,
         mir_unreachable,
         mir_unwind_cleanup,
         mir_unwind_continue,
@@ -1206,6 +1240,7 @@ symbols! {
         modifiers,
         module,
         module_path,
+        more_maybe_bounds,
         more_qualified_paths,
         more_struct_aliases,
         movbe_target_feature,
@@ -1220,6 +1255,7 @@ symbols! {
         mut_preserve_binding_mode_2024,
         mut_ref,
         naked,
+        naked_asm,
         naked_functions,
         name,
         names,
@@ -1251,6 +1287,7 @@ symbols! {
         new_binary,
         new_const,
         new_debug,
+        new_debug_noop,
         new_display,
         new_lower_exp,
         new_lower_hex,
@@ -1303,11 +1340,13 @@ symbols! {
         offset_of,
         offset_of_enum,
         offset_of_nested,
+        offset_of_slice,
         ok_or_else,
         omit_gdb_pretty_printer_section,
         on,
         on_unimplemented,
         opaque,
+        ops,
         opt_out_copy,
         optimize,
         optimize_attribute,
@@ -1369,6 +1408,7 @@ symbols! {
         passes,
         pat,
         pat_param,
+        patchable_function_entry,
         path,
         pattern_complexity,
         pattern_parentheses,
@@ -1382,6 +1422,7 @@ symbols! {
         plugin,
         plugin_registrar,
         plugins,
+        pointee,
         pointee_trait,
         pointer,
         pointer_like,
@@ -1406,6 +1447,7 @@ symbols! {
         prefetch_read_instruction,
         prefetch_write_data,
         prefetch_write_instruction,
+        prefix_nops,
         preg,
         prelude,
         prelude_import,
@@ -1487,6 +1529,7 @@ symbols! {
         recursion_limit,
         reexport_test_harness_main,
         ref_pat_eat_one_layer_2024,
+        ref_pat_eat_one_layer_2024_structural,
         ref_pat_everywhere,
         ref_unwind_safe_trait,
         reference,
@@ -1552,6 +1595,7 @@ symbols! {
         rust_2018_preview,
         rust_2021,
         rust_2024,
+        rust_analyzer,
         rust_begin_unwind,
         rust_cold_cc,
         rust_eh_catch_typeinfo,
@@ -1586,9 +1630,11 @@ symbols! {
         rustc_dirty,
         rustc_do_not_const_check,
         rustc_doc_primitive,
+        rustc_driver,
         rustc_dummy,
-        rustc_dump_env_program_clauses,
-        rustc_dump_program_clauses,
+        rustc_dump_def_parents,
+        rustc_dump_item_bounds,
+        rustc_dump_predicates,
         rustc_dump_user_args,
         rustc_dump_vtable,
         rustc_effective_visibility,
@@ -1610,6 +1656,7 @@ symbols! {
         rustc_lint_opt_deny_field_access,
         rustc_lint_opt_ty,
         rustc_lint_query_instability,
+        rustc_lint_untracked_query_information,
         rustc_macro_transparency,
         rustc_main,
         rustc_mir,
@@ -1636,9 +1683,11 @@ symbols! {
         rustc_private,
         rustc_proc_macro_decls,
         rustc_promotable,
+        rustc_pub_transparent,
         rustc_reallocator,
         rustc_regions,
         rustc_reservation_impl,
+        rustc_runtime,
         rustc_safe_intrinsic,
         rustc_serialize,
         rustc_skip_during_method_dispatch,
@@ -1659,6 +1708,7 @@ symbols! {
         rvalue_static_promotion,
         rwpi,
         s,
+        s390x_target_feature,
         safety,
         sanitize,
         sanitizer_cfi_generalize_pointers,
@@ -1667,12 +1717,16 @@ symbols! {
         saturating_add,
         saturating_div,
         saturating_sub,
+        select_unpredictable,
         self_in_typedefs,
         self_struct_ctor,
         semitransparent,
+        sha512_sm_x86,
         shadow_call_stack,
+        shallow,
         shl,
         shl_assign,
+        shorter_tail_lifetimes,
         should_panic,
         shr,
         shr_assign,
@@ -1852,6 +1906,7 @@ symbols! {
         three_way_compare,
         thumb2,
         thumb_mode: "thumb-mode",
+        time,
         tmm_reg,
         to_owned_method,
         to_string,
@@ -1895,6 +1950,7 @@ symbols! {
         type_ascription,
         type_changing_struct_update,
         type_id,
+        type_ir_inherent,
         type_length_limit,
         type_macros,
         type_name,
@@ -1961,12 +2017,16 @@ symbols! {
         unreachable_display,
         unreachable_macro,
         unrestricted_attribute_tokens,
+        unsafe_attributes,
         unsafe_block_in_unsafe_fn,
         unsafe_cell,
         unsafe_cell_raw_get,
+        unsafe_extern_blocks,
         unsafe_no_drop_flag,
         unsafe_pin_internals,
         unsize,
+        unsized_const_param_ty,
+        unsized_const_params,
         unsized_fn_params,
         unsized_locals,
         unsized_tuple_coercion,
@@ -2039,14 +2099,18 @@ symbols! {
         write_str,
         write_via_move,
         writeln_macro,
+        x86_amx_intrinsics,
         x87_reg,
         xer,
         xmm_reg,
+        xop_target_feature,
         yeet_desugar_details,
         yeet_expr,
         yes,
         yield_expr,
         ymm_reg,
+        zfh,
+        zfhmin,
         zmm_reg,
     }
 }
@@ -2401,13 +2465,11 @@ pub mod kw {
 /// Given that `sym` is imported, use them like `sym::symbol_name`.
 /// For example `sym::rustfmt` or `sym::u8`.
 pub mod sym {
-    use super::Symbol;
-
-    #[doc(inline)]
-    pub use super::sym_generated::*;
-
     // Used from a macro in `librustc_feature/accepted.rs`
     pub use super::kw::MacroRules as macro_rules;
+    #[doc(inline)]
+    pub use super::sym_generated::*;
+    use super::Symbol;
 
     /// Get the symbol for an integer.
     ///
@@ -2517,5 +2579,44 @@ impl Ident {
     /// How was it written originally? Did it use the raw form? Let's try to guess.
     pub fn is_raw_guess(self) -> bool {
         self.name.can_be_raw() && self.is_reserved()
+    }
+}
+
+/// An iterator over all the keywords in Rust.
+#[derive(Copy, Clone)]
+pub struct AllKeywords {
+    curr_idx: u32,
+    end_idx: u32,
+}
+
+impl AllKeywords {
+    /// Initialize a new iterator over all the keywords.
+    ///
+    /// *Note:* Please update this if a new keyword is added beyond the current
+    /// range.
+    pub fn new() -> Self {
+        AllKeywords { curr_idx: kw::Empty.as_u32(), end_idx: kw::Yeet.as_u32() }
+    }
+
+    /// Collect all the keywords in a given edition into a vector.
+    pub fn collect_used(&self, edition: impl Copy + FnOnce() -> Edition) -> Vec<Symbol> {
+        self.filter(|&keyword| {
+            keyword.is_used_keyword_always() || keyword.is_used_keyword_conditional(edition)
+        })
+        .collect()
+    }
+}
+
+impl Iterator for AllKeywords {
+    type Item = Symbol;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.curr_idx <= self.end_idx {
+            let keyword = Symbol::new(self.curr_idx);
+            self.curr_idx += 1;
+            Some(keyword)
+        } else {
+            None
+        }
     }
 }

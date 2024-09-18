@@ -5,29 +5,20 @@
 #[cfg(test)]
 mod tests;
 
-use crate::os::unix::prelude::*;
+use core::slice::memchr;
+
+use libc::{c_char, c_int, c_void};
 
 use crate::error::Error as StdError;
 use crate::ffi::{CStr, CString, OsStr, OsString};
-use crate::fmt;
-use crate::io;
-use crate::iter;
-use crate::mem;
+use crate::os::unix::prelude::*;
 use crate::path::{self, PathBuf};
-use crate::ptr;
-use crate::slice;
-use crate::str;
 use crate::sync::{PoisonError, RwLock};
 use crate::sys::common::small_c_string::{run_path_with_cstr, run_with_cstr};
-use crate::sys::cvt;
-use crate::sys::fd;
-use crate::vec;
-use core::slice::memchr;
-
 #[cfg(all(target_env = "gnu", not(target_os = "vxworks")))]
 use crate::sys::weak::weak;
-
-use libc::{c_char, c_int, c_void};
+use crate::sys::{cvt, fd};
+use crate::{fmt, io, iter, mem, ptr, slice, str, vec};
 
 const TMPBUF_SZ: usize = 128;
 
@@ -40,7 +31,7 @@ cfg_if::cfg_if! {
 }
 
 extern "C" {
-    #[cfg(not(any(target_os = "dragonfly", target_os = "vxworks")))]
+    #[cfg(not(any(target_os = "dragonfly", target_os = "vxworks", target_os = "rtems")))]
     #[cfg_attr(
         any(
             target_os = "linux",
@@ -70,13 +61,14 @@ extern "C" {
 }
 
 /// Returns the platform-specific value of errno
-#[cfg(not(any(target_os = "dragonfly", target_os = "vxworks")))]
+#[cfg(not(any(target_os = "dragonfly", target_os = "vxworks", target_os = "rtems")))]
 pub fn errno() -> i32 {
     unsafe { (*errno_location()) as i32 }
 }
 
 /// Sets the platform-specific value of errno
-#[cfg(all(not(target_os = "dragonfly"), not(target_os = "vxworks")))] // needed for readdir and syscall!
+// needed for readdir and syscall!
+#[cfg(all(not(target_os = "dragonfly"), not(target_os = "vxworks"), not(target_os = "rtems")))]
 #[allow(dead_code)] // but not all target cfgs actually end up using it
 pub fn set_errno(e: i32) {
     unsafe { *errno_location() = e as c_int }
@@ -85,6 +77,16 @@ pub fn set_errno(e: i32) {
 #[cfg(target_os = "vxworks")]
 pub fn errno() -> i32 {
     unsafe { libc::errnoGet() }
+}
+
+#[cfg(target_os = "rtems")]
+pub fn errno() -> i32 {
+    extern "C" {
+        #[thread_local]
+        static _tls_errno: c_int;
+    }
+
+    unsafe { _tls_errno as i32 }
 }
 
 #[cfg(target_os = "dragonfly")]
@@ -248,13 +250,12 @@ impl StdError for JoinPathsError {
 
 #[cfg(target_os = "aix")]
 pub fn current_exe() -> io::Result<PathBuf> {
-    use crate::io::ErrorKind;
-
     #[cfg(test)]
     use realstd::env;
 
     #[cfg(not(test))]
     use crate::env;
+    use crate::io::ErrorKind;
 
     let exe_path = env::args().next().ok_or(io::const_io_error!(
         ErrorKind::NotFound,
@@ -462,27 +463,27 @@ pub fn current_exe() -> io::Result<PathBuf> {
 
 #[cfg(target_os = "haiku")]
 pub fn current_exe() -> io::Result<PathBuf> {
+    let mut name = vec![0; libc::PATH_MAX as usize];
     unsafe {
-        let mut info: mem::MaybeUninit<libc::image_info> = mem::MaybeUninit::uninit();
-        let mut cookie: i32 = 0;
-        // the executable can be found at team id 0
-        let result = libc::_get_next_image_info(
-            0,
-            &mut cookie,
-            info.as_mut_ptr(),
-            mem::size_of::<libc::image_info>(),
+        let result = libc::find_path(
+            crate::ptr::null_mut(),
+            libc::path_base_directory::B_FIND_PATH_IMAGE_PATH,
+            crate::ptr::null_mut(),
+            name.as_mut_ptr(),
+            name.len(),
         );
-        if result != 0 {
+        if result != libc::B_OK {
             use crate::io::ErrorKind;
             Err(io::const_io_error!(ErrorKind::Uncategorized, "Error getting executable path"))
         } else {
-            let name = CStr::from_ptr((*info.as_ptr()).name.as_ptr()).to_bytes();
+            // find_path adds the null terminator.
+            let name = CStr::from_ptr(name.as_ptr()).to_bytes();
             Ok(PathBuf::from(OsStr::from_bytes(name)))
         }
     }
 }
 
-#[cfg(target_os = "redox")]
+#[cfg(any(target_os = "redox", target_os = "rtems"))]
 pub fn current_exe() -> io::Result<PathBuf> {
     crate::fs::read_to_string("sys:exe").map(PathBuf::from)
 }
@@ -513,13 +514,12 @@ pub fn current_exe() -> io::Result<PathBuf> {
 
 #[cfg(target_os = "fuchsia")]
 pub fn current_exe() -> io::Result<PathBuf> {
-    use crate::io::ErrorKind;
-
     #[cfg(test)]
     use realstd::env;
 
     #[cfg(not(test))]
     use crate::env;
+    use crate::io::ErrorKind;
 
     let exe_path = env::args().next().ok_or(io::const_io_error!(
         ErrorKind::Uncategorized,
@@ -738,17 +738,17 @@ pub fn home_dir() -> Option<PathBuf> {
             n => n as usize,
         };
         let mut buf = Vec::with_capacity(amt);
-        let mut passwd: libc::passwd = mem::zeroed();
+        let mut p = mem::MaybeUninit::<libc::passwd>::uninit();
         let mut result = ptr::null_mut();
         match libc::getpwuid_r(
             libc::getuid(),
-            &mut passwd,
+            p.as_mut_ptr(),
             buf.as_mut_ptr(),
             buf.capacity(),
             &mut result,
         ) {
             0 if !result.is_null() => {
-                let ptr = passwd.pw_dir as *const _;
+                let ptr = (*result).pw_dir as *const _;
                 let bytes = CStr::from_ptr(ptr).to_bytes().to_vec();
                 Some(OsStringExt::from_vec(bytes))
             }
@@ -758,6 +758,7 @@ pub fn home_dir() -> Option<PathBuf> {
 }
 
 pub fn exit(code: i32) -> ! {
+    crate::sys::exit_guard::unique_thread_exit();
     unsafe { libc::exit(code as c_int) }
 }
 

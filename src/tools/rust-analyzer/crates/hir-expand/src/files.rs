@@ -1,10 +1,10 @@
 //! Things to wrap other things in file ids.
-use std::iter;
+use std::borrow::Borrow;
 
 use either::Either;
 use span::{
-    AstIdNode, ErasedFileAstId, FileAstId, FileId, FileRange, HirFileId, HirFileIdRepr,
-    MacroFileId, SyntaxContextId,
+    AstIdNode, EditionedFileId, ErasedFileAstId, FileAstId, HirFileId, HirFileIdRepr, MacroFileId,
+    SyntaxContextId,
 };
 use syntax::{AstNode, AstPtr, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange, TextSize};
 
@@ -27,7 +27,36 @@ pub struct InFileWrapper<FileKind, T> {
 }
 pub type InFile<T> = InFileWrapper<HirFileId, T>;
 pub type InMacroFile<T> = InFileWrapper<MacroFileId, T>;
-pub type InRealFile<T> = InFileWrapper<FileId, T>;
+pub type InRealFile<T> = InFileWrapper<EditionedFileId, T>;
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub struct FilePositionWrapper<FileKind> {
+    pub file_id: FileKind,
+    pub offset: TextSize,
+}
+pub type HirFilePosition = FilePositionWrapper<HirFileId>;
+pub type MacroFilePosition = FilePositionWrapper<MacroFileId>;
+pub type FilePosition = FilePositionWrapper<EditionedFileId>;
+
+impl From<FilePositionWrapper<EditionedFileId>> for FilePositionWrapper<span::FileId> {
+    fn from(value: FilePositionWrapper<EditionedFileId>) -> Self {
+        FilePositionWrapper { file_id: value.file_id.into(), offset: value.offset }
+    }
+}
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub struct FileRangeWrapper<FileKind> {
+    pub file_id: FileKind,
+    pub range: TextRange,
+}
+pub type HirFileRange = FileRangeWrapper<HirFileId>;
+pub type MacroFileRange = FileRangeWrapper<MacroFileId>;
+pub type FileRange = FileRangeWrapper<EditionedFileId>;
+
+impl From<FileRangeWrapper<EditionedFileId>> for FileRangeWrapper<span::FileId> {
+    fn from(value: FileRangeWrapper<EditionedFileId>) -> Self {
+        FileRangeWrapper { file_id: value.file_id.into(), range: value.range }
+    }
+}
 
 /// `AstId` points to an AST node in any file.
 ///
@@ -78,6 +107,13 @@ impl<FileKind: Copy, T> InFileWrapper<FileKind, T> {
     pub fn as_ref(&self) -> InFileWrapper<FileKind, &T> {
         self.with_value(&self.value)
     }
+
+    pub fn borrow<U>(&self) -> InFileWrapper<FileKind, &U>
+    where
+        T: Borrow<U>,
+    {
+        self.with_value(self.value.borrow())
+    }
 }
 
 impl<FileKind: Copy, T: Clone> InFileWrapper<FileKind, &T> {
@@ -121,7 +157,7 @@ trait FileIdToSyntax: Copy {
     fn file_syntax(self, db: &dyn db::ExpandDatabase) -> SyntaxNode;
 }
 
-impl FileIdToSyntax for FileId {
+impl FileIdToSyntax for EditionedFileId {
     fn file_syntax(self, db: &dyn db::ExpandDatabase) -> SyntaxNode {
         db.parse(self).syntax_node()
     }
@@ -150,10 +186,38 @@ impl<FileId: Copy, N: AstNode> InFileWrapper<FileId, N> {
     }
 }
 
-// region:specific impls
+impl<FileId: Copy, N: AstNode> InFileWrapper<FileId, &N> {
+    // unfortunately `syntax` collides with the impl above, because `&_` is fundamental
+    pub fn syntax_ref(&self) -> InFileWrapper<FileId, &SyntaxNode> {
+        self.with_value(self.value.syntax())
+    }
+}
 
-impl InFile<&SyntaxNode> {
-    /// Traverse up macro calls and skips the macro invocation node
+// region:specific impls
+impl<SN: Borrow<SyntaxNode>> InRealFile<SN> {
+    pub fn file_range(&self) -> FileRange {
+        FileRange { file_id: self.file_id, range: self.value.borrow().text_range() }
+    }
+}
+
+impl<SN: Borrow<SyntaxNode>> InFile<SN> {
+    pub fn parent_ancestors_with_macros(
+        self,
+        db: &dyn db::ExpandDatabase,
+    ) -> impl Iterator<Item = InFile<SyntaxNode>> + '_ {
+        let succ = move |node: &InFile<SyntaxNode>| match node.value.parent() {
+            Some(parent) => Some(node.with_value(parent)),
+            None => db
+                .lookup_intern_macro_call(node.file_id.macro_file()?.macro_call_id)
+                .to_node_item(db)
+                .syntax()
+                .cloned()
+                .map(|node| node.parent())
+                .transpose(),
+        };
+        std::iter::successors(succ(&self.borrow().cloned()), succ)
+    }
+
     pub fn ancestors_with_macros(
         self,
         db: &dyn db::ExpandDatabase,
@@ -168,7 +232,15 @@ impl InFile<&SyntaxNode> {
                 .map(|node| node.parent())
                 .transpose(),
         };
-        iter::successors(succ(&self.cloned()), succ)
+        std::iter::successors(Some(self.borrow().cloned()), succ)
+    }
+
+    pub fn kind(&self) -> parser::SyntaxKind {
+        self.value.borrow().kind()
+    }
+
+    pub fn text_range(&self) -> TextRange {
+        self.value.borrow().text_range()
     }
 
     /// Falls back to the macro call range if the node cannot be mapped up fully.
@@ -176,7 +248,7 @@ impl InFile<&SyntaxNode> {
     /// For attributes and derives, this will point back to the attribute only.
     /// For the entire item use [`InFile::original_file_range_full`].
     pub fn original_file_range_rooted(self, db: &dyn db::ExpandDatabase) -> FileRange {
-        self.map(SyntaxNode::text_range).original_node_file_range_rooted(db)
+        self.borrow().map(SyntaxNode::text_range).original_node_file_range_rooted(db)
     }
 
     /// Falls back to the macro call range if the node cannot be mapped up fully.
@@ -184,15 +256,7 @@ impl InFile<&SyntaxNode> {
         self,
         db: &dyn db::ExpandDatabase,
     ) -> FileRange {
-        self.map(SyntaxNode::text_range).original_node_file_range_with_macro_call_body(db)
-    }
-
-    /// Attempts to map the syntax node back up its macro calls.
-    pub fn original_file_range_opt(
-        self,
-        db: &dyn db::ExpandDatabase,
-    ) -> Option<(FileRange, SyntaxContextId)> {
-        self.map(SyntaxNode::text_range).original_node_file_range_opt(db)
+        self.borrow().map(SyntaxNode::text_range).original_node_file_range_with_macro_call_body(db)
     }
 
     pub fn original_syntax_node_rooted(
@@ -203,16 +267,19 @@ impl InFile<&SyntaxNode> {
         // as we don't have node inputs otherwise and therefore can't find an `N` node in the input
         let file_id = match self.file_id.repr() {
             HirFileIdRepr::FileId(file_id) => {
-                return Some(InRealFile { file_id, value: self.value.clone() })
+                return Some(InRealFile { file_id, value: self.value.borrow().clone() })
             }
             HirFileIdRepr::MacroFile(m) if m.is_attr_macro(db) => m,
             _ => return None,
         };
 
-        let FileRange { file_id, range } =
-            map_node_range_up_rooted(db, &db.expansion_span_map(file_id), self.value.text_range())?;
+        let FileRange { file_id, range } = map_node_range_up_rooted(
+            db,
+            &db.expansion_span_map(file_id),
+            self.value.borrow().text_range(),
+        )?;
 
-        let kind = self.value.kind();
+        let kind = self.kind();
         let value = db
             .parse(file_id)
             .syntax_node()
@@ -221,6 +288,16 @@ impl InFile<&SyntaxNode> {
             .take_while(|it| it.text_range() == range)
             .find(|it| it.kind() == kind)?;
         Some(InRealFile::new(file_id, value))
+    }
+}
+
+impl InFile<&SyntaxNode> {
+    /// Attempts to map the syntax node back up its macro calls.
+    pub fn original_file_range_opt(
+        self,
+        db: &dyn db::ExpandDatabase,
+    ) -> Option<(FileRange, SyntaxContextId)> {
+        self.borrow().map(SyntaxNode::text_range).original_node_file_range_opt(db)
     }
 }
 
@@ -382,5 +459,14 @@ impl<N: AstNode> InFile<N> {
         let anc = db.parse(file_id).syntax_node().covering_element(range);
         let value = anc.ancestors().find_map(N::cast)?;
         Some(InRealFile::new(file_id, value))
+    }
+}
+
+impl<T> InFile<T> {
+    pub fn into_real_file(self) -> Result<InRealFile<T>, InFile<T>> {
+        match self.file_id.repr() {
+            HirFileIdRepr::FileId(file_id) => Ok(InRealFile { file_id, value: self.value }),
+            HirFileIdRepr::MacroFile(_) => Err(self),
+        }
     }
 }

@@ -1,5 +1,5 @@
 use clippy_utils::diagnostics::{span_lint, span_lint_and_sugg, span_lint_and_then};
-use clippy_utils::source::{snippet_opt, snippet_with_context};
+use clippy_utils::source::{snippet_with_context, SpanRangeExt};
 use clippy_utils::sugg::{has_enclosing_paren, Sugg};
 use clippy_utils::{get_item_name, get_parent_as_impl, is_lint_allowed, peel_ref_operators};
 use rustc_ast::ast::LitKind;
@@ -121,11 +121,9 @@ declare_lint_pass!(LenZero => [LEN_ZERO, LEN_WITHOUT_IS_EMPTY, COMPARISON_TO_EMP
 
 impl<'tcx> LateLintPass<'tcx> for LenZero {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'_>) {
-        if item.span.from_expansion() {
-            return;
-        }
-
-        if let ItemKind::Trait(_, _, _, _, trait_items) = item.kind {
+        if let ItemKind::Trait(_, _, _, _, trait_items) = item.kind
+            && !item.span.from_expansion()
+        {
             check_trait_items(cx, item, trait_items);
         }
     }
@@ -162,17 +160,14 @@ impl<'tcx> LateLintPass<'tcx> for LenZero {
     }
 
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
-        if expr.span.from_expansion() {
-            return;
-        }
-
         if let ExprKind::Let(lt) = expr.kind
-            && has_is_empty(cx, lt.init)
             && match lt.pat.kind {
                 PatKind::Slice([], None, []) => true,
                 PatKind::Lit(lit) if is_empty_string(lit) => true,
                 _ => false,
             }
+            && !expr.span.from_expansion()
+            && has_is_empty(cx, lt.init)
         {
             let mut applicability = Applicability::MachineApplicable;
 
@@ -190,7 +185,9 @@ impl<'tcx> LateLintPass<'tcx> for LenZero {
             );
         }
 
-        if let ExprKind::Binary(Spanned { node: cmp, .. }, left, right) = expr.kind {
+        if let ExprKind::Binary(Spanned { node: cmp, .. }, left, right) = expr.kind
+            && !expr.span.from_expansion()
+        {
             // expr.span might contains parenthesis, see issue #10529
             let actual_span = span_without_enclosing_paren(cx, expr.span);
             match cmp {
@@ -219,7 +216,7 @@ impl<'tcx> LateLintPass<'tcx> for LenZero {
 }
 
 fn span_without_enclosing_paren(cx: &LateContext<'_>, span: Span) -> Span {
-    let Some(snippet) = snippet_opt(cx, span) else {
+    let Some(snippet) = span.get_source_text(cx) else {
         return span;
     };
     if has_enclosing_paren(snippet) {

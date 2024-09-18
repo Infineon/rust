@@ -221,12 +221,12 @@ pub fn eq_expr(l: &Expr, r: &Expr) -> bool {
         ) => {
             eq_closure_binder(lb, rb)
                 && lc == rc
-                && la.map_or(false, CoroutineKind::is_async) == ra.map_or(false, CoroutineKind::is_async)
+                && eq_coroutine_kind(*la, *ra)
                 && lm == rm
                 && eq_fn_decl(lf, rf)
                 && eq_expr(le, re)
         },
-        (Gen(lc, lb, lk), Gen(rc, rb, rk)) => lc == rc && eq_block(lb, rb) && lk == rk,
+        (Gen(lc, lb, lk, _), Gen(rc, rb, rk, _)) => lc == rc && eq_block(lb, rb) && lk == rk,
         (Range(lf, lt, ll), Range(rf, rt, rl)) => ll == rl && eq_expr_opt(lf, rf) && eq_expr_opt(lt, rt),
         (AddrOf(lbk, lm, le), AddrOf(rbk, rm, re)) => lbk == rbk && lm == rm && eq_expr(le, re),
         (Path(lq, lp), Path(rq, rp)) => both(lq, rq, eq_qself) && eq_path(lp, rp),
@@ -237,6 +237,16 @@ pub fn eq_expr(l: &Expr, r: &Expr) -> bool {
                 && eq_struct_rest(&lse.rest, &rse.rest)
                 && unordered_over(&lse.fields, &rse.fields, eq_field)
         },
+        _ => false,
+    }
+}
+
+fn eq_coroutine_kind(a: Option<CoroutineKind>, b: Option<CoroutineKind>) -> bool {
+    match (a, b) {
+        (Some(CoroutineKind::Async { .. }), Some(CoroutineKind::Async { .. }))
+        | (Some(CoroutineKind::Gen { .. }), Some(CoroutineKind::Gen { .. }))
+        | (Some(CoroutineKind::AsyncGen { .. }), Some(CoroutineKind::AsyncGen { .. }))
+        | (None, None) => true,
         _ => false,
     }
 }
@@ -308,13 +318,15 @@ pub fn eq_item_kind(l: &ItemKind, r: &ItemKind) -> bool {
                 ty: lt,
                 mutability: lm,
                 expr: le,
+                safety: ls,
             }),
             Static(box StaticItem {
                 ty: rt,
                 mutability: rm,
                 expr: re,
+                safety: rs,
             }),
-        ) => lm == rm && eq_ty(lt, rt) && eq_expr_opt(le, re),
+        ) => lm == rm && ls == rs && eq_ty(lt, rt) && eq_expr_opt(le, re),
         (
             Const(box ConstItem {
                 defaultness: ld,
@@ -447,17 +459,19 @@ pub fn eq_foreign_item_kind(l: &ForeignItemKind, r: &ForeignItemKind) -> bool {
     use ForeignItemKind::*;
     match (l, r) {
         (
-            Static(box StaticForeignItem {
+            Static(box StaticItem {
                 ty: lt,
                 mutability: lm,
                 expr: le,
+                safety: ls,
             }),
-            Static(box StaticForeignItem {
+            Static(box StaticItem {
                 ty: rt,
                 mutability: rm,
                 expr: re,
+                safety: rs,
             }),
-        ) => lm == rm && eq_ty(lt, rt) && eq_expr_opt(le, re),
+        ) => lm == rm && eq_ty(lt, rt) && eq_expr_opt(le, re) && ls == rs,
         (
             Fn(box ast::Fn {
                 defaultness: ld,
@@ -720,12 +734,7 @@ pub fn eq_ty(l: &Ty, r: &Ty) -> bool {
         (Tup(l), Tup(r)) => over(l, r, |l, r| eq_ty(l, r)),
         (Path(lq, lp), Path(rq, rp)) => both(lq, rq, eq_qself) && eq_path(lp, rp),
         (TraitObject(lg, ls), TraitObject(rg, rs)) => ls == rs && over(lg, rg, eq_generic_bound),
-        (ImplTrait(_, lg, lc), ImplTrait(_, rg, rc)) => {
-            over(lg, rg, eq_generic_bound)
-                && both(lc, rc, |lc, rc| {
-                    over(lc.0.as_slice(), rc.0.as_slice(), eq_precise_capture)
-                })
-        },
+        (ImplTrait(_, lg), ImplTrait(_, rg)) => over(lg, rg, eq_generic_bound),
         (Typeof(l), Typeof(r)) => eq_expr(&l.value, &r.value),
         (MacCall(l), MacCall(r)) => eq_mac_call(l, r),
         _ => false,

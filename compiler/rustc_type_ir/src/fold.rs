@@ -45,13 +45,15 @@
 //! - u.fold_with(folder)
 //! ```
 
-use rustc_index::{Idx, IndexVec};
 use std::mem;
-use tracing::debug;
 
+use rustc_index::{Idx, IndexVec};
+use tracing::instrument;
+
+use crate::data_structures::Lrc;
 use crate::inherent::*;
 use crate::visit::{TypeVisitable, TypeVisitableExt as _};
-use crate::{self as ty, Interner, Lrc};
+use crate::{self as ty, Interner};
 
 #[cfg(feature = "nightly")]
 type Never = !;
@@ -89,7 +91,6 @@ pub trait TypeFoldable<I: Interner>: TypeVisitable<I> {
     fn fold_with<F: TypeFolder<I>>(self, folder: &mut F) -> Self {
         match self.try_fold_with(folder) {
             Ok(t) => t,
-            Err(e) => match e {},
         }
     }
 }
@@ -113,7 +114,6 @@ pub trait TypeSuperFoldable<I: Interner>: TypeFoldable<I> {
     fn super_fold_with<F: TypeFolder<I>>(self, folder: &mut F) -> Self {
         match self.try_super_fold_with(folder) {
             Ok(t) => t,
-            Err(e) => match e {},
         }
     }
 }
@@ -128,7 +128,7 @@ pub trait TypeSuperFoldable<I: Interner>: TypeFoldable<I> {
 /// the infallible methods of this trait to ensure that the two APIs
 /// are coherent.
 pub trait TypeFolder<I: Interner>: FallibleTypeFolder<I, Error = Never> {
-    fn interner(&self) -> I;
+    fn cx(&self) -> I;
 
     fn fold_binder<T>(&mut self, t: ty::Binder<I, T>) -> ty::Binder<I, T>
     where
@@ -166,7 +166,7 @@ pub trait TypeFolder<I: Interner>: FallibleTypeFolder<I, Error = Never> {
 pub trait FallibleTypeFolder<I: Interner>: Sized {
     type Error;
 
-    fn interner(&self) -> I;
+    fn cx(&self) -> I;
 
     fn try_fold_binder<T>(&mut self, t: ty::Binder<I, T>) -> Result<ty::Binder<I, T>, Self::Error>
     where
@@ -202,8 +202,8 @@ where
 {
     type Error = Never;
 
-    fn interner(&self) -> I {
-        TypeFolder::interner(self)
+    fn cx(&self) -> I {
+        TypeFolder::cx(self)
     }
 
     fn try_fold_binder<T>(&mut self, t: ty::Binder<I, T>) -> Result<ty::Binder<I, T>, Never>
@@ -322,6 +322,12 @@ impl<I: Interner, T: TypeFoldable<I>> TypeFoldable<I> for Vec<T> {
     }
 }
 
+impl<I: Interner, T: TypeFoldable<I>> TypeFoldable<I> for Box<[T]> {
+    fn try_fold_with<F: FallibleTypeFolder<I>>(self, folder: &mut F) -> Result<Self, F::Error> {
+        Vec::from(self).try_fold_with(folder).map(Vec::into_boxed_slice)
+    }
+}
+
 impl<I: Interner, T: TypeFoldable<I>, Ix: Idx> TypeFoldable<I> for IndexVec<Ix, T> {
     fn try_fold_with<F: FallibleTypeFolder<I>>(self, folder: &mut F) -> Result<Self, F::Error> {
         self.raw.try_fold_with(folder).map(IndexVec::from_raw)
@@ -338,20 +344,20 @@ impl<I: Interner, T: TypeFoldable<I>, Ix: Idx> TypeFoldable<I> for IndexVec<Ix, 
 // `rustc_middle/src/ty/generic_args.rs` for more details.
 
 struct Shifter<I: Interner> {
-    tcx: I,
+    cx: I,
     current_index: ty::DebruijnIndex,
     amount: u32,
 }
 
 impl<I: Interner> Shifter<I> {
-    pub fn new(tcx: I, amount: u32) -> Self {
-        Shifter { tcx, current_index: ty::INNERMOST, amount }
+    fn new(cx: I, amount: u32) -> Self {
+        Shifter { cx, current_index: ty::INNERMOST, amount }
     }
 }
 
 impl<I: Interner> TypeFolder<I> for Shifter<I> {
-    fn interner(&self) -> I {
-        self.tcx
+    fn cx(&self) -> I {
+        self.cx
     }
 
     fn fold_binder<T: TypeFoldable<I>>(&mut self, t: ty::Binder<I, T>) -> ty::Binder<I, T> {
@@ -365,7 +371,7 @@ impl<I: Interner> TypeFolder<I> for Shifter<I> {
         match r.kind() {
             ty::ReBound(debruijn, br) if debruijn >= self.current_index => {
                 let debruijn = debruijn.shifted_in(self.amount);
-                Region::new_bound(self.tcx, debruijn, br)
+                Region::new_bound(self.cx, debruijn, br)
             }
             _ => r,
         }
@@ -375,7 +381,7 @@ impl<I: Interner> TypeFolder<I> for Shifter<I> {
         match ty.kind() {
             ty::Bound(debruijn, bound_ty) if debruijn >= self.current_index => {
                 let debruijn = debruijn.shifted_in(self.amount);
-                Ty::new_bound(self.tcx, debruijn, bound_ty)
+                Ty::new_bound(self.cx, debruijn, bound_ty)
             }
 
             _ if ty.has_vars_bound_at_or_above(self.current_index) => ty.super_fold_with(self),
@@ -387,7 +393,7 @@ impl<I: Interner> TypeFolder<I> for Shifter<I> {
         match ct.kind() {
             ty::ConstKind::Bound(debruijn, bound_ct) if debruijn >= self.current_index => {
                 let debruijn = debruijn.shifted_in(self.amount);
-                Const::new_bound(self.tcx, debruijn, bound_ct, ct.ty())
+                Const::new_bound(self.cx, debruijn, bound_ct)
             }
             _ => ct.super_fold_with(self),
         }
@@ -398,24 +404,23 @@ impl<I: Interner> TypeFolder<I> for Shifter<I> {
     }
 }
 
-pub fn shift_region<I: Interner>(tcx: I, region: I::Region, amount: u32) -> I::Region {
+pub fn shift_region<I: Interner>(cx: I, region: I::Region, amount: u32) -> I::Region {
     match region.kind() {
         ty::ReBound(debruijn, br) if amount > 0 => {
-            Region::new_bound(tcx, debruijn.shifted_in(amount), br)
+            Region::new_bound(cx, debruijn.shifted_in(amount), br)
         }
         _ => region,
     }
 }
 
-pub fn shift_vars<I: Interner, T>(tcx: I, value: T, amount: u32) -> T
+#[instrument(level = "trace", skip(cx), ret)]
+pub fn shift_vars<I: Interner, T>(cx: I, value: T, amount: u32) -> T
 where
     T: TypeFoldable<I>,
 {
-    debug!("shift_vars(value={:?}, amount={})", value, amount);
-
     if amount == 0 || !value.has_escaping_bound_vars() {
-        return value;
+        value
+    } else {
+        value.fold_with(&mut Shifter::new(cx, amount))
     }
-
-    value.fold_with(&mut Shifter::new(tcx, amount))
 }

@@ -1,25 +1,20 @@
 //@ ignore-cross-compile
 
-use run_make_support::{htmldocck, rustc, rustdoc, tmp_dir};
+use run_make_support::{htmldocck, rust_lib_name, rustc, rustdoc};
 
 fn main() {
-    let tmp_dir = tmp_dir();
-    let out_dir = tmp_dir.join("rustdoc");
-    let ex_dir = tmp_dir.join("ex.calls");
+    let out_dir = "rustdoc";
+    let ex_dir = "ex.calls";
     let proc_crate_name = "foobar_macro";
     let crate_name = "foobar";
 
-    let dylib_name = String::from_utf8(
-        rustc()
-            .crate_name(proc_crate_name)
-            .crate_type("dylib")
-            .arg("--print")
-            .arg("file-names")
-            .arg("-")
-            .command_output()
-            .stdout,
-    )
-    .unwrap();
+    let dylib_name = rustc()
+        .crate_name(proc_crate_name)
+        .crate_type("dylib")
+        .print("file-names")
+        .arg("-")
+        .run()
+        .stdout_utf8();
 
     rustc()
         .input("src/proc.rs")
@@ -40,9 +35,9 @@ fn main() {
         .input("examples/ex.rs")
         .crate_name("ex")
         .crate_type("bin")
-        .output(&out_dir)
-        .extern_(crate_name, tmp_dir.join(format!("lib{crate_name}.rlib")))
-        .extern_(proc_crate_name, tmp_dir.join(dylib_name.trim()))
+        .out_dir(&out_dir)
+        .extern_(crate_name, rust_lib_name(crate_name))
+        .extern_(proc_crate_name, dylib_name.trim())
         .arg("-Zunstable-options")
         .arg("--scrape-examples-output-path")
         .arg(&ex_dir)
@@ -54,11 +49,11 @@ fn main() {
         .input("src/lib.rs")
         .crate_name(crate_name)
         .crate_type("lib")
-        .output(&out_dir)
+        .out_dir(&out_dir)
         .arg("-Zunstable-options")
         .arg("--with-examples")
         .arg(&ex_dir)
         .run();
 
-    assert!(htmldocck().arg(out_dir).arg("src/lib.rs").status().unwrap().success());
+    htmldocck().arg(out_dir).arg("src/lib.rs").run();
 }

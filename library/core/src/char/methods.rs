@@ -1,11 +1,10 @@
 //! impl char {}
 
+use super::*;
 use crate::slice;
 use crate::str::from_utf8_unchecked_mut;
 use crate::unicode::printable::is_printable;
 use crate::unicode::{self, conversions};
-
-use super::*;
 
 impl char {
     /// The lowest valid code point a `char` can have, `'\0'`.
@@ -16,7 +15,6 @@ impl char {
     /// for you:
     ///
     /// ```
-    /// #![feature(char_min)]
     /// let dist = u32::from(char::MAX) - u32::from(char::MIN);
     /// let size = (char::MIN..=char::MAX).count() as u32;
     /// assert!(size < dist);
@@ -30,7 +28,6 @@ impl char {
     /// # Examples
     ///
     /// ```
-    /// #![feature(char_min)]
     /// # fn something_which_returns_char() -> char { 'a' }
     /// let c: char = something_which_returns_char();
     /// assert!(char::MIN <= c);
@@ -38,7 +35,7 @@ impl char {
     /// let value_at_min = u32::from(char::MIN);
     /// assert_eq!(char::from_u32(value_at_min), Some('\0'));
     /// ```
-    #[unstable(feature = "char_min", issue = "114298")]
+    #[stable(feature = "char_min", since = "CURRENT_RUSTC_VERSION")]
     pub const MIN: char = '\0';
 
     /// The highest valid code point a `char` can have, `'\u{10FFFF}'`.
@@ -49,7 +46,6 @@ impl char {
     /// for you:
     ///
     /// ```
-    /// #![feature(char_min)]
     /// let dist = u32::from(char::MAX) - u32::from(char::MIN);
     /// let size = (char::MIN..=char::MAX).count() as u32;
     /// assert!(size < dist);
@@ -223,7 +219,7 @@ impl char {
     /// assert_eq!('❤', c);
     /// ```
     #[stable(feature = "assoc_char_funcs", since = "1.52.0")]
-    #[rustc_const_unstable(feature = "const_char_from_u32_unchecked", issue = "89259")]
+    #[rustc_const_stable(feature = "const_char_from_u32_unchecked", since = "1.81.0")]
     #[must_use]
     #[inline]
     pub const unsafe fn from_u32_unchecked(i: u32) -> char {
@@ -387,7 +383,7 @@ impl char {
             // Force the 6th bit to be set to ensure ascii is lower case.
             digit = (self as u32 | 0b10_0000).wrapping_sub('a' as u32).saturating_add(10);
         }
-        // FIXME: once then_some is const fn, use it here
+        // FIXME(const-hack): once then_some is const fn, use it here
         if digit < radix { Some(digit) } else { None }
     }
 

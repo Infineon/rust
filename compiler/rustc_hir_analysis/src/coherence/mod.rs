@@ -5,13 +5,17 @@
 // done by the orphan and overlap modules. Then we build up various
 // mappings. That mapping code resides here.
 
-use crate::errors;
-use rustc_errors::{codes::*, struct_span_code_err};
+use rustc_errors::codes::*;
+use rustc_errors::struct_span_code_err;
 use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_hir::LangItem;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
 use rustc_session::parse::feature_err;
 use rustc_span::{sym, ErrorGuaranteed};
+use tracing::debug;
+
+use crate::errors;
 
 mod builtin;
 mod inherent_impls;
@@ -49,17 +53,15 @@ fn enforce_trait_manually_implementable(
 ) -> Result<(), ErrorGuaranteed> {
     let impl_header_span = tcx.def_span(impl_def_id);
 
-    if tcx.lang_items().freeze_trait() == Some(trait_def_id) {
-        if !tcx.features().freeze_impls {
-            feature_err(
-                &tcx.sess,
-                sym::freeze_impls,
-                impl_header_span,
-                "explicit impls for the `Freeze` trait are not permitted",
-            )
-            .with_span_label(impl_header_span, format!("impl of `Freeze` not allowed"))
-            .emit();
-        }
+    if tcx.is_lang_item(trait_def_id, LangItem::Freeze) && !tcx.features().freeze_impls {
+        feature_err(
+            &tcx.sess,
+            sym::freeze_impls,
+            impl_header_span,
+            "explicit impls for the `Freeze` trait are not permitted",
+        )
+        .with_span_label(impl_header_span, format!("impl of `Freeze` not allowed"))
+        .emit();
     }
 
     // Disallow *all* explicit impls of traits marked `#[rustc_deny_explicit_impl]`
@@ -75,7 +77,7 @@ fn enforce_trait_manually_implementable(
 
         // Maintain explicit error code for `Unsize`, since it has a useful
         // explanation about using `CoerceUnsized` instead.
-        if Some(trait_def_id) == tcx.lang_items().unsize_trait() {
+        if tcx.is_lang_item(trait_def_id, LangItem::Unsize) {
             err.code(E0328);
         }
 
@@ -120,7 +122,7 @@ fn enforce_empty_impls_for_marker_traits(
     .emit())
 }
 
-pub fn provide(providers: &mut Providers) {
+pub(crate) fn provide(providers: &mut Providers) {
     use self::builtin::coerce_unsized_info;
     use self::inherent_impls::{crate_incoherent_impls, crate_inherent_impls, inherent_impls};
     use self::inherent_impls_overlap::crate_inherent_impls_overlap_check;

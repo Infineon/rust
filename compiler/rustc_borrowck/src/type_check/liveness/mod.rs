@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use itertools::{Either, Itertools};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::mir::visit::{TyContext, Visitor};
@@ -9,16 +11,12 @@ use rustc_mir_dataflow::impls::MaybeInitializedPlaces;
 use rustc_mir_dataflow::move_paths::MoveData;
 use rustc_mir_dataflow::points::DenseLocationMap;
 use rustc_mir_dataflow::ResultsCursor;
-use std::rc::Rc;
-
-use crate::{
-    constraints::OutlivesConstraintSet,
-    facts::{AllFacts, AllFactsExt},
-    region_infer::values::LivenessValues,
-    universal_regions::UniversalRegions,
-};
+use tracing::debug;
 
 use super::TypeChecker;
+use crate::constraints::OutlivesConstraintSet;
+use crate::region_infer::values::LivenessValues;
+use crate::universal_regions::UniversalRegions;
 
 mod local_use_map;
 mod polonius;
@@ -32,13 +30,12 @@ mod trace;
 ///
 /// N.B., this computation requires normalization; therefore, it must be
 /// performed before
-pub(super) fn generate<'mir, 'tcx>(
+pub(super) fn generate<'a, 'tcx>(
     typeck: &mut TypeChecker<'_, 'tcx>,
     body: &Body<'tcx>,
     elements: &Rc<DenseLocationMap>,
-    flow_inits: &mut ResultsCursor<'mir, 'tcx, MaybeInitializedPlaces<'mir, 'tcx>>,
+    flow_inits: &mut ResultsCursor<'a, 'tcx, MaybeInitializedPlaces<'a, 'tcx>>,
     move_data: &MoveData<'tcx>,
-    use_polonius: bool,
 ) {
     debug!("liveness::generate");
 
@@ -49,11 +46,8 @@ pub(super) fn generate<'mir, 'tcx>(
     );
     let (relevant_live_locals, boring_locals) =
         compute_relevant_live_locals(typeck.tcx(), &free_regions, body);
-    let facts_enabled = use_polonius || AllFacts::enabled(typeck.tcx());
 
-    if facts_enabled {
-        polonius::populate_access_facts(typeck, body, move_data);
-    };
+    polonius::populate_access_facts(typeck, body, move_data);
 
     trace::trace(
         typeck,
@@ -154,12 +148,12 @@ fn record_regular_live_regions<'tcx>(
 }
 
 /// Visitor looking for regions that should be live within rvalues or calls.
-struct LiveVariablesVisitor<'cx, 'tcx> {
+struct LiveVariablesVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    liveness_constraints: &'cx mut LivenessValues,
+    liveness_constraints: &'a mut LivenessValues,
 }
 
-impl<'cx, 'tcx> Visitor<'tcx> for LiveVariablesVisitor<'cx, 'tcx> {
+impl<'a, 'tcx> Visitor<'tcx> for LiveVariablesVisitor<'a, 'tcx> {
     /// We sometimes have `args` within an rvalue, or within a
     /// call. Make them live at the location where they appear.
     fn visit_args(&mut self, args: &GenericArgsRef<'tcx>, location: Location) {
@@ -194,7 +188,7 @@ impl<'cx, 'tcx> Visitor<'tcx> for LiveVariablesVisitor<'cx, 'tcx> {
     }
 }
 
-impl<'cx, 'tcx> LiveVariablesVisitor<'cx, 'tcx> {
+impl<'a, 'tcx> LiveVariablesVisitor<'a, 'tcx> {
     /// Some variable is "regular live" at `location` -- i.e., it may be used later. This means that
     /// all regions appearing in the type of `value` must be live at `location`.
     fn record_regions_live_at<T>(&mut self, value: T, location: Location)

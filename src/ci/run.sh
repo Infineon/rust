@@ -19,7 +19,7 @@ if [ "$NO_CHANGE_USER" = "" ]; then
     # already be running with the right user.
     #
     # For NO_CHANGE_USER done in the small number of Dockerfiles affected.
-    echo -e '[safe]\n\tdirectory = *' > /home/user/gitconfig
+    echo -e '[safe]\n\tdirectory = *' > /home/user/.gitconfig
 
     exec su --preserve-environment -c "env PATH=$PATH \"$0\"" user
   fi
@@ -84,6 +84,10 @@ fi
 # process by recompressing the existing xz ones. This decreases the storage
 # space required for CI artifacts.
 RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --dist-compression-formats=xz"
+
+if [ "$EXTERNAL_LLVM" = "1" ]; then
+  RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set rust.lld=false"
+fi
 
 # Enable the `c` feature for compiler_builtins, but only when the `compiler-rt` source is available
 # (to avoid spending a lot of time cloning llvm)

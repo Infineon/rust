@@ -6,27 +6,31 @@ mod expr;
 mod fixup;
 mod item;
 
-use crate::pp::Breaks::{Consistent, Inconsistent};
-use crate::pp::{self, Breaks};
-use crate::pprust::state::fixup::FixupContext;
+use std::borrow::Cow;
+
 use ast::TraitBoundModifiers;
 use rustc_ast::attr::AttrIdGenerator;
 use rustc_ast::ptr::P;
-use rustc_ast::token::{self, BinOpToken, CommentKind, Delimiter, Nonterminal, Token, TokenKind};
+use rustc_ast::token::{
+    self, BinOpToken, CommentKind, Delimiter, IdentIsRaw, Nonterminal, Token, TokenKind,
+};
 use rustc_ast::tokenstream::{Spacing, TokenStream, TokenTree};
 use rustc_ast::util::classify;
 use rustc_ast::util::comments::{Comment, CommentStyle};
-use rustc_ast::{self as ast, AttrArgs, AttrArgsEq, BlockCheckMode, PatKind};
-use rustc_ast::{attr, BindingMode, ByRef, DelimArgs, RangeEnd, RangeSyntax, Term};
-use rustc_ast::{GenericArg, GenericBound, SelfKind};
-use rustc_ast::{InlineAsmOperand, InlineAsmRegOrRegClass};
-use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
+use rustc_ast::{
+    self as ast, attr, AttrArgs, AttrArgsEq, BindingMode, BlockCheckMode, ByRef, DelimArgs,
+    GenericArg, GenericBound, InlineAsmOperand, InlineAsmOptions, InlineAsmRegOrRegClass,
+    InlineAsmTemplatePiece, PatKind, RangeEnd, RangeSyntax, Safety, SelfKind, Term,
+};
 use rustc_span::edition::Edition;
 use rustc_span::source_map::{SourceMap, Spanned};
 use rustc_span::symbol::{kw, sym, Ident, IdentPrinter, Symbol};
 use rustc_span::{BytePos, CharPos, FileName, Pos, Span, DUMMY_SP};
-use std::borrow::Cow;
 use thin_vec::ThinVec;
+
+use crate::pp::Breaks::{Consistent, Inconsistent};
+use crate::pp::{self, Breaks};
+use crate::pprust::state::fixup::FixupContext;
 
 pub enum MacHeader<'a> {
     Path(&'a ast::Path),
@@ -249,6 +253,7 @@ pub fn print_crate<'a>(
         let fake_attr = attr::mk_attr_nested_word(
             g,
             ast::AttrStyle::Inner,
+            Safety::Default,
             sym::feature,
             sym::prelude_import,
             DUMMY_SP,
@@ -259,7 +264,13 @@ pub fn print_crate<'a>(
         // root, so this is not needed, and actually breaks things.
         if edition.is_rust_2015() {
             // `#![no_std]`
-            let fake_attr = attr::mk_attr_word(g, ast::AttrStyle::Inner, sym::no_std, DUMMY_SP);
+            let fake_attr = attr::mk_attr_word(
+                g,
+                ast::AttrStyle::Inner,
+                Safety::Default,
+                sym::no_std,
+                DUMMY_SP,
+            );
             s.print_attribute(&fake_attr);
         }
     }
@@ -283,8 +294,7 @@ pub fn print_crate<'a>(
 fn space_between(tt1: &TokenTree, tt2: &TokenTree) -> bool {
     use token::*;
     use Delimiter::*;
-    use TokenTree::Delimited as Del;
-    use TokenTree::Token as Tok;
+    use TokenTree::{Delimited as Del, Token as Tok};
 
     fn is_punct(tt: &TokenTree) -> bool {
         matches!(tt, TokenTree::Token(tok, _) if tok.is_punct())
@@ -494,8 +504,8 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
                 if !self.is_beginning_of_line() {
                     self.word(" ");
                 }
-                if cmnt.lines.len() == 1 {
-                    self.word(cmnt.lines[0].clone());
+                if let [line] = cmnt.lines.as_slice() {
+                    self.word(line.clone());
                     self.hardbreak()
                 } else {
                     self.visual_align();
@@ -870,18 +880,11 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
     }
 
     fn nonterminal_to_string(&self, nt: &Nonterminal) -> String {
-        match nt {
-            token::NtExpr(e) => self.expr_to_string(e),
-            token::NtMeta(e) => self.attr_item_to_string(e),
-            token::NtTy(e) => self.ty_to_string(e),
-            token::NtPath(e) => self.path_to_string(e),
-            token::NtItem(e) => self.item_to_string(e),
-            token::NtBlock(e) => self.block_to_string(e),
-            token::NtStmt(e) => self.stmt_to_string(e),
-            token::NtPat(e) => self.pat_to_string(e),
-            token::NtLiteral(e) => self.expr_to_string(e),
-            token::NtVis(e) => self.vis_to_string(e),
-        }
+        // We extract the token stream from the AST fragment and pretty print
+        // it, rather than using AST pretty printing, because `Nonterminal` is
+        // slated for removal in #124141. (This method will also then be
+        // removed.)
+        self.tts_to_string(&TokenStream::from_nonterminal_ast(nt))
     }
 
     /// Print the token kind precisely, without converting `$crate` into its respective crate name.
@@ -946,8 +949,13 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
             token::NtIdent(ident, is_raw) => {
                 IdentPrinter::for_ast_ident(ident, is_raw.into()).to_string().into()
             }
-            token::Lifetime(name) => name.to_string().into(),
-            token::NtLifetime(ident) => ident.name.to_string().into(),
+
+            token::Lifetime(name, IdentIsRaw::No)
+            | token::NtLifetime(Ident { name, .. }, IdentIsRaw::No) => name.to_string().into(),
+            token::Lifetime(name, IdentIsRaw::Yes)
+            | token::NtLifetime(Ident { name, .. }, IdentIsRaw::Yes) => {
+                format!("'r#{}", &name.as_str()[1..]).into()
+            }
 
             /* Other */
             token::DocComment(comment_kind, attr_style, data) => {
@@ -1015,6 +1023,10 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
         Self::to_string(|s| s.print_attr_item(ai, ai.path.span))
     }
 
+    fn tts_to_string(&self, tokens: &TokenStream) -> String {
+        Self::to_string(|s| s.print_tts(tokens, false))
+    }
+
     fn to_string(f: impl FnOnce(&mut State<'_>)) -> String {
         let mut printer = State::new();
         f(&mut printer);
@@ -1055,6 +1067,11 @@ impl<'a> PrintState<'a> for State<'a> {
                 self.commasep(Inconsistent, &data.inputs, |s, ty| s.print_type(ty));
                 self.word(")");
                 self.print_fn_ret_ty(&data.output);
+            }
+            ast::GenericArgs::ParenthesizedElided(_) => {
+                self.word("(");
+                self.word("..");
+                self.word(")");
             }
         }
     }
@@ -1183,17 +1200,8 @@ impl<'a> State<'a> {
                 }
                 self.print_type_bounds(bounds);
             }
-            ast::TyKind::ImplTrait(_, bounds, precise_capturing_args) => {
+            ast::TyKind::ImplTrait(_, bounds) => {
                 self.word_nbsp("impl");
-                if let Some((precise_capturing_args, ..)) = precise_capturing_args.as_deref() {
-                    self.word("use");
-                    self.word("<");
-                    self.commasep(Inconsistent, precise_capturing_args, |s, arg| match arg {
-                        ast::PreciseCapturingArg::Arg(p, _) => s.print_path(p, false, 0),
-                        ast::PreciseCapturingArg::Lifetime(lt) => s.print_lifetime(*lt),
-                    });
-                    self.word(">")
-                }
                 self.print_type_bounds(bounds);
             }
             ast::TyKind::Array(ty, length) => {
@@ -1505,35 +1513,7 @@ impl<'a> State<'a> {
             AsmArg::Options(opts) => {
                 s.word("options");
                 s.popen();
-                let mut options = vec![];
-                if opts.contains(InlineAsmOptions::PURE) {
-                    options.push("pure");
-                }
-                if opts.contains(InlineAsmOptions::NOMEM) {
-                    options.push("nomem");
-                }
-                if opts.contains(InlineAsmOptions::READONLY) {
-                    options.push("readonly");
-                }
-                if opts.contains(InlineAsmOptions::PRESERVES_FLAGS) {
-                    options.push("preserves_flags");
-                }
-                if opts.contains(InlineAsmOptions::NORETURN) {
-                    options.push("noreturn");
-                }
-                if opts.contains(InlineAsmOptions::NOSTACK) {
-                    options.push("nostack");
-                }
-                if opts.contains(InlineAsmOptions::ATT_SYNTAX) {
-                    options.push("att_syntax");
-                }
-                if opts.contains(InlineAsmOptions::RAW) {
-                    options.push("raw");
-                }
-                if opts.contains(InlineAsmOptions::MAY_UNWIND) {
-                    options.push("may_unwind");
-                }
-                s.commasep(Inconsistent, &options, |s, &opt| {
+                s.commasep(Inconsistent, &opts.human_readable_names(), |s, &opt| {
                     s.word(opt);
                 });
                 s.pclose();
@@ -1796,6 +1776,15 @@ impl<'a> State<'a> {
                     self.print_poly_trait_ref(tref);
                 }
                 GenericBound::Outlives(lt) => self.print_lifetime(*lt),
+                GenericBound::Use(args, _) => {
+                    self.word("use");
+                    self.word("<");
+                    self.commasep(Inconsistent, args, |s, arg| match arg {
+                        ast::PreciseCapturingArg::Arg(p, _) => s.print_path(p, false, 0),
+                        ast::PreciseCapturingArg::Lifetime(lt) => s.print_lifetime(*lt),
+                    });
+                    self.word(">")
+                }
             }
         }
     }
@@ -1973,6 +1962,7 @@ impl<'a> State<'a> {
     fn print_safety(&mut self, s: ast::Safety) {
         match s {
             ast::Safety::Default => {}
+            ast::Safety::Safe(_) => self.word_nbsp("safe"),
             ast::Safety::Unsafe(_) => self.word_nbsp("unsafe"),
         }
     }
@@ -2058,10 +2048,6 @@ impl<'a> State<'a> {
         Self::to_string(|s| {
             s.print_tt(tt, false);
         })
-    }
-
-    pub(crate) fn tts_to_string(&self, tokens: &TokenStream) -> String {
-        Self::to_string(|s| s.print_tts(tokens, false))
     }
 
     pub(crate) fn path_segment_to_string(&self, p: &ast::PathSegment) -> String {

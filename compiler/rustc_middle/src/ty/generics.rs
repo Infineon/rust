@@ -1,5 +1,3 @@
-use crate::ty;
-use crate::ty::{EarlyBinder, GenericArgsRef};
 use rustc_ast as ast;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::DefId;
@@ -9,12 +7,14 @@ use rustc_span::Span;
 use tracing::instrument;
 
 use super::{Clause, InstantiatedPredicates, ParamConst, ParamTy, Ty, TyCtxt};
+use crate::ty;
+use crate::ty::{EarlyBinder, GenericArgsRef};
 
 #[derive(Clone, Debug, TyEncodable, TyDecodable, HashStable)]
 pub enum GenericParamDefKind {
     Lifetime,
     Type { has_default: bool, synthetic: bool },
-    Const { has_default: bool, is_host_effect: bool },
+    Const { has_default: bool, is_host_effect: bool, synthetic: bool },
 }
 
 impl GenericParamDefKind {
@@ -100,19 +100,11 @@ impl GenericParamDef {
         }
     }
 
-    pub fn to_error<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        preceding_args: &[ty::GenericArg<'tcx>],
-    ) -> ty::GenericArg<'tcx> {
+    pub fn to_error<'tcx>(&self, tcx: TyCtxt<'tcx>) -> ty::GenericArg<'tcx> {
         match &self.kind {
             ty::GenericParamDefKind::Lifetime => ty::Region::new_error_misc(tcx).into(),
             ty::GenericParamDefKind::Type { .. } => Ty::new_misc_error(tcx).into(),
-            ty::GenericParamDefKind::Const { .. } => ty::Const::new_misc_error(
-                tcx,
-                tcx.type_of(self.def_id).instantiate(tcx, preceding_args),
-            )
-            .into(),
+            ty::GenericParamDefKind::Const { .. } => ty::Const::new_misc_error(tcx).into(),
         }
     }
 }
@@ -263,7 +255,9 @@ impl<'tcx> Generics {
         let param = self.param_at(param.index as usize, tcx);
         match param.kind {
             GenericParamDefKind::Lifetime => param,
-            _ => bug!("expected lifetime parameter, but found another generic parameter"),
+            _ => {
+                bug!("expected lifetime parameter, but found another generic parameter: {param:#?}")
+            }
         }
     }
 
@@ -272,16 +266,16 @@ impl<'tcx> Generics {
         let param = self.param_at(param.index as usize, tcx);
         match param.kind {
             GenericParamDefKind::Type { .. } => param,
-            _ => bug!("expected type parameter, but found another generic parameter"),
+            _ => bug!("expected type parameter, but found another generic parameter: {param:#?}"),
         }
     }
 
     /// Returns the `GenericParamDef` associated with this `ParamConst`.
-    pub fn const_param(&'tcx self, param: ParamConst, tcx: TyCtxt<'tcx>) -> &GenericParamDef {
+    pub fn const_param(&'tcx self, param: ParamConst, tcx: TyCtxt<'tcx>) -> &'tcx GenericParamDef {
         let param = self.param_at(param.index as usize, tcx);
         match param.kind {
             GenericParamDefKind::Const { .. } => param,
-            _ => bug!("expected const parameter, but found another generic parameter"),
+            _ => bug!("expected const parameter, but found another generic parameter: {param:#?}"),
         }
     }
 
@@ -379,11 +373,12 @@ impl<'tcx> Generics {
 pub struct GenericPredicates<'tcx> {
     pub parent: Option<DefId>,
     pub predicates: &'tcx [(Clause<'tcx>, Span)],
+    pub effects_min_tys: &'tcx ty::List<Ty<'tcx>>,
 }
 
 impl<'tcx> GenericPredicates<'tcx> {
     pub fn instantiate(
-        &self,
+        self,
         tcx: TyCtxt<'tcx>,
         args: GenericArgsRef<'tcx>,
     ) -> InstantiatedPredicates<'tcx> {
@@ -393,16 +388,20 @@ impl<'tcx> GenericPredicates<'tcx> {
     }
 
     pub fn instantiate_own(
-        &self,
+        self,
         tcx: TyCtxt<'tcx>,
         args: GenericArgsRef<'tcx>,
     ) -> impl Iterator<Item = (Clause<'tcx>, Span)> + DoubleEndedIterator + ExactSizeIterator {
         EarlyBinder::bind(self.predicates).iter_instantiated_copied(tcx, args)
     }
 
+    pub fn instantiate_own_identity(self) -> impl Iterator<Item = (Clause<'tcx>, Span)> {
+        EarlyBinder::bind(self.predicates).iter_identity_copied()
+    }
+
     #[instrument(level = "debug", skip(self, tcx))]
     fn instantiate_into(
-        &self,
+        self,
         tcx: TyCtxt<'tcx>,
         instantiated: &mut InstantiatedPredicates<'tcx>,
         args: GenericArgsRef<'tcx>,
@@ -416,14 +415,14 @@ impl<'tcx> GenericPredicates<'tcx> {
         instantiated.spans.extend(self.predicates.iter().map(|(_, sp)| *sp));
     }
 
-    pub fn instantiate_identity(&self, tcx: TyCtxt<'tcx>) -> InstantiatedPredicates<'tcx> {
+    pub fn instantiate_identity(self, tcx: TyCtxt<'tcx>) -> InstantiatedPredicates<'tcx> {
         let mut instantiated = InstantiatedPredicates::empty();
         self.instantiate_identity_into(tcx, &mut instantiated);
         instantiated
     }
 
     fn instantiate_identity_into(
-        &self,
+        self,
         tcx: TyCtxt<'tcx>,
         instantiated: &mut InstantiatedPredicates<'tcx>,
     ) {

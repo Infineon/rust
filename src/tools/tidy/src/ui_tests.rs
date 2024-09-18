@@ -1,21 +1,23 @@
 //! Tidy check to ensure below in UI test directories:
 //! - the number of entries in each directory must be less than `ENTRY_LIMIT`
 //! - there are no stray `.stderr` files
-use ignore::Walk;
+
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use ignore::Walk;
+
 // FIXME: GitHub's UI truncates file lists that exceed 1000 entries, so these
 // should all be 1000 or lower. Limits significantly smaller than 1000 are also
 // desirable, because large numbers of files are unwieldy in general. See issue
 // #73494.
-const ENTRY_LIMIT: u32 = 900;
+const ENTRY_LIMIT: u32 = 901;
 // FIXME: The following limits should be reduced eventually.
 
-const ISSUES_ENTRY_LIMIT: u32 = 1672;
+const ISSUES_ENTRY_LIMIT: u32 = 1673;
 
 const EXPECTED_TEST_FILE_EXTENSIONS: &[&str] = &[
     "rs",     // test source files

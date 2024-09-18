@@ -1,14 +1,11 @@
-use crate::code_stats::CodeStats;
-pub use crate::code_stats::{DataTypeKind, FieldInfo, FieldKind, SizeKind, VariantInfo};
-use crate::config::{
-    self, CoverageLevel, CrateType, FunctionReturn, InstrumentCoverage, OptLevel, OutFileName,
-    OutputType, RemapPathScopeComponents, SwitchWithOptPath,
-};
-use crate::config::{ErrorOutputType, Input};
-use crate::errors;
-use crate::parse::{add_feature_diagnostics, ParseSess};
-use crate::search_paths::{PathKind, SearchPath};
-use crate::{filesearch, lint};
+use std::any::Any;
+use std::ops::{Div, Mul};
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::SeqCst;
+use std::sync::Arc;
+use std::{env, fmt, io};
 
 use rustc_data_structures::flock;
 use rustc_data_structures::fx::{FxHashMap, FxIndexSet};
@@ -18,33 +15,35 @@ use rustc_data_structures::sync::{
     AtomicU64, DynSend, DynSync, Lock, Lrc, MappedReadGuard, ReadGuard, RwLock,
 };
 use rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitter;
+use rustc_errors::codes::*;
 use rustc_errors::emitter::{stderr_destination, DynEmitter, HumanEmitter, HumanReadableErrorType};
 use rustc_errors::json::JsonEmitter;
 use rustc_errors::registry::Registry;
 use rustc_errors::{
-    codes::*, fallback_fluent_bundle, Diag, DiagCtxt, DiagMessage, Diagnostic, ErrorGuaranteed,
-    FatalAbort, FluentBundle, LazyFallbackBundle, TerminalUrl,
+    fallback_fluent_bundle, Diag, DiagCtxt, DiagCtxtHandle, DiagMessage, Diagnostic,
+    ErrorGuaranteed, FatalAbort, FluentBundle, LazyFallbackBundle, TerminalUrl,
 };
 use rustc_macros::HashStable_Generic;
 pub use rustc_span::def_id::StableCrateId;
 use rustc_span::edition::Edition;
 use rustc_span::source_map::{FilePathMapping, SourceMap};
-use rustc_span::{FileNameDisplayPreference, RealFileName};
-use rustc_span::{Span, Symbol};
+use rustc_span::{FileNameDisplayPreference, RealFileName, Span, Symbol};
 use rustc_target::asm::InlineAsmArch;
-use rustc_target::spec::{CodeModel, PanicStrategy, RelocModel, RelroLevel};
 use rustc_target::spec::{
-    DebuginfoKind, SanitizerSet, SplitDebuginfo, StackProtector, Target, TargetTriple, TlsModel,
+    CodeModel, DebuginfoKind, PanicStrategy, RelocModel, RelroLevel, SanitizerSet,
+    SmallDataThresholdSupport, SplitDebuginfo, StackProtector, Target, TargetTriple, TlsModel,
 };
 
-use std::any::Any;
-use std::env;
-use std::fmt;
-use std::io;
-use std::ops::{Div, Mul};
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
-use std::sync::{atomic::AtomicBool, atomic::Ordering::SeqCst, Arc};
+use crate::code_stats::CodeStats;
+pub use crate::code_stats::{DataTypeKind, FieldInfo, FieldKind, SizeKind, VariantInfo};
+use crate::config::{
+    self, CoverageLevel, CrateType, DebugInfo, ErrorOutputType, FunctionReturn, Input,
+    InstrumentCoverage, OptLevel, OutFileName, OutputType, RemapPathScopeComponents,
+    SwitchWithOptPath,
+};
+use crate::parse::{add_feature_diagnostics, ParseSess};
+use crate::search_paths::{PathKind, SearchPath};
+use crate::{errors, filesearch, lint};
 
 struct OptimizationFuel {
     /// If `-zfuel=crate=n` is specified, initially set to `n`, otherwise `0`.
@@ -328,8 +327,8 @@ impl Session {
     }
 
     #[inline]
-    pub fn dcx(&self) -> &DiagCtxt {
-        &self.psess.dcx
+    pub fn dcx(&self) -> DiagCtxtHandle<'_> {
+        self.psess.dcx()
     }
 
     #[inline]
@@ -361,6 +360,11 @@ impl Session {
     pub fn instrument_coverage_mcdc(&self) -> bool {
         self.instrument_coverage()
             && self.opts.unstable_opts.coverage_options.level >= CoverageLevel::Mcdc
+    }
+
+    /// True if `-Zcoverage-options=no-mir-spans` was passed.
+    pub fn coverage_no_mir_spans(&self) -> bool {
+        self.opts.unstable_opts.coverage_options.no_mir_spans
     }
 
     pub fn is_sanitizer_cfi_enabled(&self) -> bool {
@@ -436,22 +440,10 @@ impl Session {
     }
 
     pub fn target_filesearch(&self, kind: PathKind) -> filesearch::FileSearch<'_> {
-        filesearch::FileSearch::new(
-            &self.sysroot,
-            self.opts.target_triple.triple(),
-            &self.opts.search_paths,
-            &self.target_tlib_path,
-            kind,
-        )
+        filesearch::FileSearch::new(&self.opts.search_paths, &self.target_tlib_path, kind)
     }
     pub fn host_filesearch(&self, kind: PathKind) -> filesearch::FileSearch<'_> {
-        filesearch::FileSearch::new(
-            &self.sysroot,
-            config::host_triple(),
-            &self.opts.search_paths,
-            &self.host_tlib_path,
-            kind,
-        )
+        filesearch::FileSearch::new(&self.opts.search_paths, &self.host_tlib_path, kind)
     }
 
     /// Returns a list of directories where target-specific tool binaries are located. Some fallback
@@ -947,10 +939,10 @@ fn default_emitter(
         t => t,
     };
     match sopts.error_format {
-        config::ErrorOutputType::HumanReadable(kind) => {
-            let (short, color_config) = kind.unzip();
+        config::ErrorOutputType::HumanReadable(kind, color_config) => {
+            let short = kind.short();
 
-            if let HumanReadableErrorType::AnnotateSnippet(_) = kind {
+            if let HumanReadableErrorType::AnnotateSnippet = kind {
                 let emitter = AnnotateSnippetEmitter::new(
                     Some(source_map),
                     bundle,
@@ -975,13 +967,14 @@ fn default_emitter(
                 Box::new(emitter.ui_testing(sopts.unstable_opts.ui_testing))
             }
         }
-        config::ErrorOutputType::Json { pretty, json_rendered } => Box::new(
+        config::ErrorOutputType::Json { pretty, json_rendered, color_config } => Box::new(
             JsonEmitter::new(
                 Box::new(io::BufWriter::new(io::stderr())),
                 source_map,
                 fallback_bundle,
                 pretty,
                 json_rendered,
+                color_config,
             )
             .registry(Some(registry))
             .fluent_bundle(bundle)
@@ -1065,7 +1058,7 @@ pub fn build_session(
         match profiler {
             Ok(profiler) => Some(Arc::new(profiler)),
             Err(e) => {
-                dcx.emit_warn(errors::FailedToCreateProfiler { err: e.to_string() });
+                dcx.handle().emit_warn(errors::FailedToCreateProfiler { err: e.to_string() });
                 None
             }
         }
@@ -1184,7 +1177,12 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
 
     // Sanitizers can only be used on platforms that we know have working sanitizer codegen.
     let supported_sanitizers = sess.target.options.supported_sanitizers;
-    let unsupported_sanitizers = sess.opts.unstable_opts.sanitizer - supported_sanitizers;
+    let mut unsupported_sanitizers = sess.opts.unstable_opts.sanitizer - supported_sanitizers;
+    // Niche: if `fixed-x18`, or effectively switching on `reserved-x18` flag, is enabled
+    // we should allow Shadow Call Stack sanitizer.
+    if sess.opts.unstable_opts.fixed_x18 && sess.target.arch == "aarch64" {
+        unsupported_sanitizers -= SanitizerSet::SHADOWCALLSTACK;
+    }
     match unsupported_sanitizers.into_iter().count() {
         0 => {}
         1 => {
@@ -1280,6 +1278,14 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
         }
     }
 
+    if sess.opts.unstable_opts.small_data_threshold.is_some() {
+        if sess.target.small_data_threshold_support() == SmallDataThresholdSupport::None {
+            sess.dcx().emit_warn(errors::SmallDataThresholdNotSupportedForTarget {
+                target_triple: &sess.opts.target_triple,
+            })
+        }
+    }
+
     if sess.opts.unstable_opts.branch_protection.is_some() && sess.target.arch != "aarch64" {
         sess.dcx().emit_err(errors::BranchProtectionRequiresAArch64);
     }
@@ -1295,6 +1301,19 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
     {
         sess.dcx()
             .emit_err(errors::SplitDebugInfoUnstablePlatform { debuginfo: sess.split_debuginfo() });
+    }
+
+    if sess.opts.unstable_opts.embed_source {
+        let dwarf_version =
+            sess.opts.unstable_opts.dwarf_version.unwrap_or(sess.target.default_dwarf_version);
+
+        if dwarf_version < 5 {
+            sess.dcx().emit_warn(errors::EmbedSourceInsufficientDwarfVersion { dwarf_version });
+        }
+
+        if sess.opts.debuginfo == DebugInfo::None {
+            sess.dcx().emit_warn(errors::EmbedSourceRequiresDebugInfo);
+        }
     }
 
     if sess.opts.unstable_opts.instrument_xray.is_some() && !sess.target.options.supports_xray {
@@ -1327,6 +1346,16 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
             {
                 sess.dcx().emit_err(errors::FunctionReturnThunkExternRequiresNonLargeCodeModel);
             }
+        }
+    }
+
+    if sess.opts.cg.soft_float {
+        if sess.target.arch == "arm" && sess.target.abi == "eabihf" {
+            sess.dcx().emit_warn(errors::SoftFloatDeprecated);
+        } else {
+            // All `use_softfp` does is the equivalent of `-mfloat-abi` in GCC/clang, which only exists on ARM targets.
+            // We document this flag to only affect `*eabihf` targets, so let's show a warning for all other targets.
+            sess.dcx().emit_warn(errors::SoftFloatIgnored);
         }
     }
 }
@@ -1366,7 +1395,7 @@ impl EarlyDiagCtxt {
     /// format. Any errors prior to that will cause an abort and all stashed diagnostics of the
     /// previous dcx will be emitted.
     pub fn abort_if_error_and_set_error_format(&mut self, output: ErrorOutputType) {
-        self.dcx.abort_if_errors();
+        self.dcx.handle().abort_if_errors();
 
         let emitter = mk_emitter(output);
         self.dcx = DiagCtxt::new(emitter);
@@ -1375,44 +1404,44 @@ impl EarlyDiagCtxt {
     #[allow(rustc::untranslatable_diagnostic)]
     #[allow(rustc::diagnostic_outside_of_impl)]
     pub fn early_note(&self, msg: impl Into<DiagMessage>) {
-        self.dcx.note(msg)
+        self.dcx.handle().note(msg)
     }
 
     #[allow(rustc::untranslatable_diagnostic)]
     #[allow(rustc::diagnostic_outside_of_impl)]
     pub fn early_help(&self, msg: impl Into<DiagMessage>) {
-        self.dcx.struct_help(msg).emit()
+        self.dcx.handle().struct_help(msg).emit()
     }
 
     #[allow(rustc::untranslatable_diagnostic)]
     #[allow(rustc::diagnostic_outside_of_impl)]
     #[must_use = "ErrorGuaranteed must be returned from `run_compiler` in order to exit with a non-zero status code"]
     pub fn early_err(&self, msg: impl Into<DiagMessage>) -> ErrorGuaranteed {
-        self.dcx.err(msg)
+        self.dcx.handle().err(msg)
     }
 
     #[allow(rustc::untranslatable_diagnostic)]
     #[allow(rustc::diagnostic_outside_of_impl)]
     pub fn early_fatal(&self, msg: impl Into<DiagMessage>) -> ! {
-        self.dcx.fatal(msg)
+        self.dcx.handle().fatal(msg)
     }
 
     #[allow(rustc::untranslatable_diagnostic)]
     #[allow(rustc::diagnostic_outside_of_impl)]
     pub fn early_struct_fatal(&self, msg: impl Into<DiagMessage>) -> Diag<'_, FatalAbort> {
-        self.dcx.struct_fatal(msg)
+        self.dcx.handle().struct_fatal(msg)
     }
 
     #[allow(rustc::untranslatable_diagnostic)]
     #[allow(rustc::diagnostic_outside_of_impl)]
     pub fn early_warn(&self, msg: impl Into<DiagMessage>) {
-        self.dcx.warn(msg)
+        self.dcx.handle().warn(msg)
     }
 
     #[allow(rustc::untranslatable_diagnostic)]
     #[allow(rustc::diagnostic_outside_of_impl)]
     pub fn early_struct_warn(&self, msg: impl Into<DiagMessage>) -> Diag<'_, ()> {
-        self.dcx.struct_warn(msg)
+        self.dcx.handle().struct_warn(msg)
     }
 }
 
@@ -1422,20 +1451,23 @@ fn mk_emitter(output: ErrorOutputType) -> Box<DynEmitter> {
     let fallback_bundle =
         fallback_fluent_bundle(vec![rustc_errors::DEFAULT_LOCALE_RESOURCE], false);
     let emitter: Box<DynEmitter> = match output {
-        config::ErrorOutputType::HumanReadable(kind) => {
-            let (short, color_config) = kind.unzip();
+        config::ErrorOutputType::HumanReadable(kind, color_config) => {
+            let short = kind.short();
             Box::new(
                 HumanEmitter::new(stderr_destination(color_config), fallback_bundle)
                     .short_message(short),
             )
         }
-        config::ErrorOutputType::Json { pretty, json_rendered } => Box::new(JsonEmitter::new(
-            Box::new(io::BufWriter::new(io::stderr())),
-            Lrc::new(SourceMap::new(FilePathMapping::empty())),
-            fallback_bundle,
-            pretty,
-            json_rendered,
-        )),
+        config::ErrorOutputType::Json { pretty, json_rendered, color_config } => {
+            Box::new(JsonEmitter::new(
+                Box::new(io::BufWriter::new(io::stderr())),
+                Lrc::new(SourceMap::new(FilePathMapping::empty())),
+                fallback_bundle,
+                pretty,
+                json_rendered,
+                color_config,
+            ))
+        }
     };
     emitter
 }
