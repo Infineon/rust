@@ -46,6 +46,7 @@ impl<'a, 'tcx> DocFolder for StabilityPropagator<'a, 'tcx> {
                     | ItemKind::UnionItem(..)
                     | ItemKind::EnumItem(..)
                     | ItemKind::FunctionItem(..)
+                    | ItemKind::TestItem(..)
                     | ItemKind::ModuleItem(..)
                     | ItemKind::TypeAliasItem(..)
                     | ItemKind::StaticItem(..)

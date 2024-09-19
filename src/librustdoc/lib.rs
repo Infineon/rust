@@ -684,6 +684,7 @@ fn opts() -> Vec<RustcOptGroup> {
             "[rust]",
         ),
         opt(Unstable, Flag, "", "html-no-source", "Disable HTML source code pages generation", ""),
+        opt(Unstable, FlagMulti, "", "document-tests", "Generate documentation for tests", ""),
     ]
 }
 
